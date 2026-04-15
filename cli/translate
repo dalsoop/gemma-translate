@@ -186,8 +186,10 @@ def main():
     # dispatch
     if args.po:
         mode_po(Path(args.po), args.source, args.target, args.api, args.workers, args.context)
-    elif args.list:
-        items = [s.strip() for s in args.list.split(",")]
+    elif args.list is not None:
+        items = [s.strip() for s in args.list.split(",") if s.strip()]
+        if not items:
+            sys.exit("에러: --list 가 비어있음. 쉼표로 구분된 문자열을 주세요.")
         res = translate_list(items, args.source, args.target, args.api, args.workers, context=args.context)
         for src_t, tr in zip(items, res):
             print(f"{src_t}\t→\t{tr}")
@@ -206,6 +208,12 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except u.URLError as e:
+        sys.stderr.write(f"에러: 번역 서버 연결 실패 — {e}\n힌트: TRANSLATE_API 환경변수 / --api 옵션 확인\n")
+        sys.exit(2)
+    except RuntimeError as e:
+        sys.stderr.write(f"에러: {e}\n")
+        sys.exit(3)
     except KeyboardInterrupt:
         sys.stderr.write("\n중단됨\n")
         sys.exit(130)

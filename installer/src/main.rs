@@ -288,11 +288,15 @@ Bug fixes:
 - max_new_tokens 기본값 1024 (긴 문장 잘림 방지)
 - 구분자 (---) 제거 후처리
 """
-import os, secrets
+import os, re, secrets
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 import httpx
+
+# BCP-47 언어코드 기본 검증 (정확한 55 Gemma 언어 리스트는 아니지만 오타 방지)
+_LANG_RE = re.compile(r"^[a-zA-Z]{2,3}(-[A-Za-z0-9]{2,8})?$")
+MAX_TOKENS_HARD_CAP = 2048
 
 LLAMA_URL = os.environ.get("LLAMA_URL", "http://127.0.0.1:18080")
 MODEL_NAME = os.environ.get("MODEL_NAME", "translategemma-27b")
@@ -337,6 +341,20 @@ class Req(BaseModel):
     source_lang_code: str = "en"
     target_lang_code: str = "ko"
     max_new_tokens: int = 1024
+
+    @field_validator("source_lang_code", "target_lang_code")
+    @classmethod
+    def _valid_lang(cls, v: str) -> str:
+        if not _LANG_RE.match(v):
+            raise ValueError(f"invalid BCP-47 language code: {v!r}")
+        return v
+
+    @field_validator("max_new_tokens")
+    @classmethod
+    def _clamp_tokens(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("max_new_tokens must be >= 1")
+        return min(v, MAX_TOKENS_HARD_CAP)
 
 
 @app.get("/health")
