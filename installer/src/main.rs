@@ -75,6 +75,31 @@ enum Cmd {
     VllmUp { gpus: String, port: u16 },
     /// vLLM 인스턴스 중지
     VllmDown { port: u16 },
+
+    /// 글로서리(표준 번역 사전) 관리
+    #[command(subcommand)]
+    Glossary(GlossaryCmd),
+}
+
+#[derive(Subcommand)]
+enum GlossaryCmd {
+    /// 항목 추가/덮어쓰기: glossary add "Save" "저장" --target ko
+    Add { source: String,
+          translation: String,
+          #[arg(long, default_value = "ko")] target: String },
+    /// 제거
+    Remove { source: String,
+             #[arg(long, default_value = "ko")] target: String },
+    /// 나열
+    List { #[arg(long)] target: Option<String> },
+    /// JSON 파일 일괄 import: {"source_text": {"ko": "번역", ...}, ...}
+    /// 또는 단순한 {"source_text": "번역"} 포맷 + --target ko
+    Import { path: String,
+             #[arg(long, default_value = "ko")] target: String,
+             /// 기존 항목 덮어쓰기 (기본은 skip)
+             #[arg(long)] overwrite: bool },
+    /// 전체 export → JSON
+    Export { #[arg(long)] out: Option<String> },
 }
 
 fn root() -> PathBuf {
@@ -97,7 +122,112 @@ fn main() -> Result<()> {
         Cmd::VllmInstall { repo, quantization } => vllm_install(&repo, &quantization),
         Cmd::VllmUp { gpus, port } => vllm_up(&gpus, port),
         Cmd::VllmDown { port } => vllm_down(port),
+        Cmd::Glossary(g) => glossary_cmd(g),
     }
+}
+
+// ─── 글로서리 ───
+
+const GLOSSARY_PATH: &str = "/etc/gemma-translate/glossary.json";
+
+fn glossary_load() -> Result<serde_json::Value> {
+    if !Path::new(GLOSSARY_PATH).exists() { return Ok(serde_json::json!({})); }
+    Ok(serde_json::from_slice(&fs::read(GLOSSARY_PATH)?)?)
+}
+
+fn glossary_save(v: &serde_json::Value) -> Result<()> {
+    fs::create_dir_all("/etc/gemma-translate")?;
+    fs::write(GLOSSARY_PATH, serde_json::to_string_pretty(v)?)?;
+    Ok(())
+}
+
+fn glossary_cmd(g: GlossaryCmd) -> Result<()> {
+    match g {
+        GlossaryCmd::Add { source, translation, target } => {
+            ensure_root()?;
+            let mut v = glossary_load()?;
+            v[&source][&target] = serde_json::Value::String(translation.clone());
+            glossary_save(&v)?;
+            println!("추가: {source:?} → ({target}) {translation:?}");
+            // shim 들 reload (글로서리는 매 요청에서 다시 읽어도 가벼움 — 별도 SIGHUP 불필요)
+        }
+        GlossaryCmd::Remove { source, target } => {
+            ensure_root()?;
+            let mut v = glossary_load()?;
+            if let Some(obj) = v.get_mut(&source).and_then(|x| x.as_object_mut()) {
+                obj.remove(&target);
+            }
+            // 빈 객체 정리
+            if v.get(&source).and_then(|x| x.as_object()).map(|o| o.is_empty()).unwrap_or(false) {
+                if let Some(obj) = v.as_object_mut() { obj.remove(&source); }
+            }
+            glossary_save(&v)?;
+            println!("제거: {source:?} ({target})");
+        }
+        GlossaryCmd::List { target } => {
+            let v = glossary_load()?;
+            let obj = v.as_object().cloned().unwrap_or_default();
+            if obj.is_empty() {
+                println!("(글로서리 비어있음 — {})", GLOSSARY_PATH);
+                return Ok(());
+            }
+            for (src, tgts) in &obj {
+                if let Some(tobj) = tgts.as_object() {
+                    for (t, tr) in tobj {
+                        if target.as_ref().map(|tt| tt == t).unwrap_or(true) {
+                            println!("{src:<40} → ({t}) {tr}",
+                                tr=tr.as_str().unwrap_or(""));
+                        }
+                    }
+                }
+            }
+        }
+        GlossaryCmd::Import { path, target, overwrite } => {
+            ensure_root()?;
+            let data = fs::read(&path).context("import file 읽기")?;
+            let incoming: serde_json::Value = serde_json::from_slice(&data)
+                .context("JSON 파싱")?;
+            let mut current = glossary_load()?;
+            let mut added = 0usize;
+            let mut skipped = 0usize;
+            if let Some(obj) = incoming.as_object() {
+                for (src, val) in obj {
+                    // 두 포맷 지원: 단순 {src: "tr"} 또는 중첩 {src: {lang: "tr"}}
+                    let translations: Vec<(String, String)> = match val {
+                        serde_json::Value::String(s) => vec![(target.clone(), s.clone())],
+                        serde_json::Value::Object(m) => m.iter()
+                            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+                            .collect(),
+                        _ => continue,
+                    };
+                    for (lang, tr) in translations {
+                        let exists = current.get(src)
+                            .and_then(|e| e.get(&lang))
+                            .is_some();
+                        if exists && !overwrite { skipped += 1; continue; }
+                        if !current.get(src).map(|v| v.is_object()).unwrap_or(false) {
+                            current[src] = serde_json::json!({});
+                        }
+                        current[src][lang] = serde_json::Value::String(tr);
+                        added += 1;
+                    }
+                }
+            } else {
+                bail!("JSON 최상위는 객체여야 함");
+            }
+            glossary_save(&current)?;
+            println!("import 완료: 추가 {added}건, skip {skipped}건 (--overwrite 미사용)");
+        }
+        GlossaryCmd::Export { out } => {
+            let v = glossary_load()?;
+            let json = serde_json::to_string_pretty(&v)?;
+            match out {
+                Some(p) => { fs::write(&p, &json)?; println!("export: {p}"); }
+                None => println!("{json}"),
+            }
+        }
+    }
+    Ok(())
 }
 
 // ─── subcommands ───
@@ -301,7 +431,26 @@ MAX_TOKENS_HARD_CAP = 2048
 LLAMA_URL = os.environ.get("LLAMA_URL", "http://127.0.0.1:18080")
 MODEL_NAME = os.environ.get("MODEL_NAME", "translategemma-27b")
 SHIM_PORT = int(os.environ.get("SHIM_PORT", "8080"))
-API_KEY = os.environ.get("TRANSLATE_API_KEY", "")  # 비어있으면 auth 없음
+API_KEY = os.environ.get("TRANSLATE_API_KEY", "")
+GLOSSARY_PATH = os.environ.get("GLOSSARY_PATH", "/etc/gemma-translate/glossary.json")
+_gc = {"data": {}, "mtime": 0.0}
+
+def _load_glossary():
+    try:
+        m = os.stat(GLOSSARY_PATH).st_mtime
+        if m != _gc["mtime"]:
+            import json as _j
+            with open(GLOSSARY_PATH) as f:
+                _gc["data"] = _j.load(f)
+            _gc["mtime"] = m
+    except FileNotFoundError:
+        _gc["data"] = {}
+    return _gc["data"]
+
+def _glossary_lookup(text, target):
+    g = _load_glossary()
+    e = g.get(text)
+    return e.get(target) if isinstance(e, dict) else None
 
 app = FastAPI()
 
@@ -375,6 +524,10 @@ async def info():
 async def translate(r: Req):
     if not r.text.strip():
         raise HTTPException(400, "empty text")
+    # 글로서리: 정확한 매치면 모델 호출 없이 즉시 반환 (결정론적 + 초고속)
+    g = _glossary_lookup(r.text, r.target_lang_code)
+    if g is not None:
+        return {"translation": g, "source": "glossary"}
     prompt = build_prompt(r.text, r.source_lang_code, r.target_lang_code)
     payload = {
         "prompt": prompt,
@@ -553,7 +706,7 @@ Environment="LD_LIBRARY_PATH={ld_path}"
 ExecStart={server} --model {gguf} --host 127.0.0.1 --port {llama_port} \
   --n-gpu-layers 999 --tensor-split {tensor_split} \
   --parallel 16 --cont-batching --flash-attn on \
-  --no-jinja --chat-template chatml --ctx-size 4096
+  --no-jinja --chat-template chatml --ctx-size 65536
 Restart=on-failure
 RestartSec=10
 LimitMEMLOCK=infinity
