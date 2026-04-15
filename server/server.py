@@ -1,12 +1,11 @@
 """
-TranslateGemma 번역 서버 — 4b-it / 27b-it / (원하는 다른 repo) 공용.
+TranslateGemma 27B-IT 번역 서버.
 
 환경변수:
-  MODEL_DIR    모델 로컬 경로 (install.sh 가 설정)
-  MODEL_NAME   프로파일 이름 (로그/메트릭용, 예: "27b-it-nf4")
+  MODEL_DIR       모델 로컬 경로 (기본 /opt/translate-gemma/model)
   TRANSLATE_PORT  리스닝 포트 (기본 8080)
   CUDA_VISIBLE_DEVICES  GPU 인덱스
-  QUANT        "nf4" (default) | "none" | "int8"
+  QUANT           "nf4" (default) | "int8" | "none"
 """
 import os, time, logging
 import torch
@@ -18,7 +17,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("translate")
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/translate-gemma/model")
-MODEL_NAME = os.environ.get("MODEL_NAME", os.path.basename(MODEL_DIR.rstrip("/")))
+MODEL_NAME = os.environ.get("MODEL_NAME", "27b-it")
 QUANT = os.environ.get("QUANT", "nf4").lower()
 
 log.info("model=%s  dir=%s  quant=%s", MODEL_NAME, MODEL_DIR, QUANT)
@@ -38,12 +37,12 @@ if QUANT == "nf4":
 elif QUANT == "int8":
     kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
 # QUANT=none → 풀 BF16
+
 model = Gemma3ForConditionalGeneration.from_pretrained(MODEL_DIR, **kwargs).eval()
 LOAD_TIME_S = time.time() - t0
-VRAM_GB = round(torch.cuda.memory_allocated() / 1e9, 2)
-log.info("loaded in %.1fs  vram=%s GB", LOAD_TIME_S, VRAM_GB)
+log.info("loaded in %.1fs  vram=%.2f GB", LOAD_TIME_S, torch.cuda.memory_allocated() / 1e9)
 
-app = FastAPI(title=f"TranslateGemma ({MODEL_NAME})")
+app = FastAPI(title="TranslateGemma 27B")
 
 
 class Req(BaseModel):
