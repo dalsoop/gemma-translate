@@ -449,8 +449,15 @@ def _load_glossary():
 
 def _glossary_lookup(text, target):
     g = _load_glossary()
+    # exact match 먼저
     e = g.get(text)
-    return e.get(target) if isinstance(e, dict) else None
+    if isinstance(e, dict) and target in e: return e[target]
+    # normalized: strip + lowercase fallback
+    tn = text.strip().lower()
+    for k, v in g.items():
+        if k.strip().lower() == tn and isinstance(v, dict) and target in v:
+            return v[target]
+    return None
 
 app = FastAPI()
 
