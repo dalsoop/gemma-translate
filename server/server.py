@@ -52,13 +52,14 @@ class Req(BaseModel):
     max_new_tokens: int = 512
 
 
+# health/info 는 asyncio 이벤트 루프에서 즉시 응답 (inference threadpool 과 분리)
 @app.get("/health")
-def health():
+async def health():
     return {"ok": True, "vram_gb": round(torch.cuda.memory_allocated() / 1e9, 2)}
 
 
 @app.get("/info")
-def info():
+async def info():
     return {
         "model": MODEL_NAME,
         "model_dir": MODEL_DIR,
