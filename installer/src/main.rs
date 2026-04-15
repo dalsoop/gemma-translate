@@ -14,7 +14,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -33,16 +33,44 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// venv + 모델 다운로드 + server.py 배치
+    /// venv + 모델 다운로드 + server.py 배치 (transformers 백엔드)
     Install,
-    /// 인스턴스 기동: up <gpu> <port>
+    /// 인스턴스 기동 (transformers 백엔드): up <gpu> <port>
     Up { gpu: u32, port: u16 },
     /// 인스턴스 중지: down <port>
     Down { port: u16 },
     /// 설치/실행 상태
     List,
-    /// /info 조회
+    /// /info 조회 (transformers 서버만)
     Info { #[arg(default_value_t = 8080)] port: u16 },
+
+    /// llama.cpp 백엔드: GGUF 다운로드 + llama-server 배치
+    LlamaInstall {
+        /// HuggingFace 저장소 (기본: bullerwins/translategemma-27b-it-GGUF)
+        #[arg(long, default_value = "bullerwins/translategemma-27b-it-GGUF")]
+        repo: String,
+        /// 양자화 필터 (기본 Q4_K_M)
+        #[arg(long, default_value = "*Q4_K_M*")]
+        quant: String,
+    },
+    /// llama.cpp 인스턴스 기동: llama-up <gpu> <port>
+    LlamaUp { gpu: u32, port: u16 },
+    /// llama.cpp 인스턴스 중지
+    LlamaDown { port: u16 },
+
+    /// vLLM 백엔드: vllm 설치 + 모델 다운로드 (기본 Infomaniak vLLM-호환 버전)
+    VllmInstall {
+        /// HuggingFace 저장소 (vLLM 호환 모델)
+        #[arg(long, default_value = "Infomaniak-AI/vllm-translategemma-27b-it")]
+        repo: String,
+        /// 양자화 옵션 (none|awq|bitsandbytes|fp8)
+        #[arg(long, default_value = "none")]
+        quantization: String,
+    },
+    /// vLLM 인스턴스 기동: vllm-up <gpu_list> <port>  (예: "0" 또는 "0,1,2,3")
+    VllmUp { gpus: String, port: u16 },
+    /// vLLM 인스턴스 중지
+    VllmDown { port: u16 },
 }
 
 fn root() -> PathBuf {
@@ -59,6 +87,12 @@ fn main() -> Result<()> {
         Cmd::Down { port } => down(port),
         Cmd::List => list(),
         Cmd::Info { port } => info(port),
+        Cmd::LlamaInstall { repo, quant } => llama_install(&repo, &quant),
+        Cmd::LlamaUp { gpu, port } => llama_up(gpu, port),
+        Cmd::LlamaDown { port } => llama_down(port),
+        Cmd::VllmInstall { repo, quantization } => vllm_install(&repo, &quantization),
+        Cmd::VllmUp { gpus, port } => vllm_up(&gpus, port),
+        Cmd::VllmDown { port } => vllm_down(port),
     }
 }
 
@@ -222,6 +256,344 @@ fn info(port: u16) -> Result<()> {
     println!("VRAM:     {:.2} GB", resp.vram_gb);
     println!("load:     {:.1} s", resp.load_time_s);
     println!("CUDA:     {}", resp.cuda_visible_devices);
+    Ok(())
+}
+
+// ─── llama.cpp 백엔드 ───
+
+const LLAMA_ROOT: &str = "/opt/llama.cpp";
+const LLAMA_MODEL_DIR: &str = "/opt/llama.cpp/models/local/translategemma-27b";
+const LLAMA_SERVER_BIN: &str = "/usr/local/bin/llama-server";
+const LLAMA_SHIM_PY: &str = "/opt/llama.cpp/translate-shim.py";
+const LLAMA_SHIM_UNIT_PREFIX: &str = "translate-llama";
+
+// 클라이언트 호환을 위한 shim (phs-translate 의 /translate 포맷을 llama-server chat completion 으로 변환)
+const SHIM_PY_CONTENTS: &str = r#"#!/usr/bin/env python3
+"""llama-server → /translate 호환 shim.
+포트 (LLAMA_PORT) 로 뜬 llama-server 에 붙어서, 우리 기존 클라이언트가 쓰는
+POST /translate {text, source_lang_code, target_lang_code} 을
+llama-server /v1/chat/completions 형식으로 변환해 호출."""
+import os, json
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+import httpx
+
+LLAMA_URL = os.environ.get("LLAMA_URL", "http://127.0.0.1:18080")
+MODEL_NAME = os.environ.get("MODEL_NAME", "translategemma-27b")
+SHIM_PORT = int(os.environ.get("SHIM_PORT", "8080"))
+
+app = FastAPI()
+client = httpx.AsyncClient(timeout=120)
+
+
+class Req(BaseModel):
+    text: str
+    source_lang_code: str = "en"
+    target_lang_code: str = "ko"
+    max_new_tokens: int = 512
+
+
+@app.get("/health")
+async def health():
+    try:
+        r = await client.get(f"{LLAMA_URL}/health")
+        return {"ok": r.status_code == 200}
+    except Exception:
+        return {"ok": False}
+
+
+@app.get("/info")
+async def info():
+    return {"model": MODEL_NAME, "backend": "llama.cpp", "upstream": LLAMA_URL, "port": SHIM_PORT}
+
+
+@app.post("/translate")
+async def translate(r: Req):
+    # TranslateGemma chat template 은 content 를 구조화 객체로 받음.
+    # llama.cpp /v1/chat/completions 에 raw json payload 를 넘긴다.
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [{
+            "role": "user",
+            "content": [{
+                "type": "text",
+                "source_lang_code": r.source_lang_code,
+                "target_lang_code": r.target_lang_code,
+                "text": r.text,
+            }],
+        }],
+        "max_tokens": r.max_new_tokens,
+        "temperature": 0,
+    }
+    try:
+        resp = await client.post(f"{LLAMA_URL}/v1/chat/completions", json=payload)
+        data = resp.json()
+        if resp.status_code >= 400:
+            raise HTTPException(500, f"llama: {data}")
+        tr = data["choices"][0]["message"]["content"].strip()
+        return {"translation": tr}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(500, f"shim error: {e}")
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=SHIM_PORT)
+"#;
+
+fn llama_install(repo: &str, quant_pattern: &str) -> Result<()> {
+    ensure_root()?;
+    if !Path::new(LLAMA_SERVER_BIN).exists() {
+        bail!("{} 없음. LXC 에 llama.cpp 이미 설치됐는지 확인", LLAMA_SERVER_BIN);
+    }
+    let hf_token = std::env::var("HF_TOKEN").context("HF_TOKEN 필요 (Gemma 게이트)")?;
+
+    println!("[1/4] hf CLI + shim deps 설치");
+    sh(&["pip", "install", "--quiet", "--break-system-packages",
+         "huggingface_hub[cli]", "hf_transfer", "fastapi", "httpx", "uvicorn"])
+        .or_else(|_| sh(&["pip", "install", "--quiet",
+                          "huggingface_hub[cli]", "hf_transfer",
+                          "fastapi", "httpx", "uvicorn"]))?;
+
+    println!("[2/4] 모델 디렉토리 준비: {LLAMA_MODEL_DIR}");
+    fs::create_dir_all(LLAMA_MODEL_DIR)?;
+
+    println!("[3/4] GGUF 다운로드: {repo}  filter={quant_pattern}");
+    // hf 바이너리 경로 탐색
+    let hf_bin = ["/usr/local/bin/hf", "/usr/bin/hf",
+                  "/usr/local/bin/huggingface-cli", "/usr/bin/huggingface-cli"]
+        .iter().find(|p| Path::new(p).exists()).map(|s| s.to_string())
+        .unwrap_or_else(|| "hf".into());
+    sh_env(
+        &[("HF_HUB_ENABLE_HF_TRANSFER", "1"), ("HF_TOKEN", &hf_token)],
+        &[&hf_bin, "download", repo,
+          "--include", quant_pattern,
+          "--local-dir", LLAMA_MODEL_DIR],
+    )?;
+
+    println!("[4/4] /translate shim 배치: {LLAMA_SHIM_PY}");
+    fs::write(LLAMA_SHIM_PY, SHIM_PY_CONTENTS)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(LLAMA_SHIM_PY, fs::Permissions::from_mode(0o755))?;
+    }
+
+    // ensure fastapi/httpx present
+    sh(&["pip", "install", "-q", "fastapi", "httpx", "uvicorn"]).ok();
+
+    println!("\n설치 완료. 다음:");
+    println!("  gemma-translate llama-up 0 8080");
+    Ok(())
+}
+
+fn pick_gguf_file() -> Result<String> {
+    let dir = Path::new(LLAMA_MODEL_DIR);
+    if !dir.exists() { bail!("{LLAMA_MODEL_DIR} 없음 — llama-install 먼저"); }
+    // 가장 큰 .gguf 파일 (멀티파트 shard 아닌 단일 파일) 또는 00001-of-XXXX 첫 shard
+    let mut best: Option<(std::path::PathBuf, u64)> = None;
+    for e in std::fs::read_dir(dir)? {
+        let e = e?;
+        let p = e.path();
+        if p.extension().and_then(|s| s.to_str()) == Some("gguf") {
+            let name = p.file_name().and_then(|s| s.to_str()).unwrap_or("");
+            // 멀티파트면 첫 shard 만
+            if name.contains("-of-") && !name.contains("00001-of-") { continue; }
+            let sz = e.metadata()?.len();
+            if best.as_ref().map(|(_, s)| sz > *s).unwrap_or(true) {
+                best = Some((p, sz));
+            }
+        }
+    }
+    best.ok_or_else(|| anyhow::anyhow!("GGUF 파일 없음: {LLAMA_MODEL_DIR}"))
+        .map(|(p, _)| p.to_string_lossy().to_string())
+}
+
+fn llama_up(gpu: u32, port: u16) -> Result<()> {
+    ensure_root()?;
+    if !Path::new(LLAMA_SHIM_PY).exists() {
+        bail!("shim 없음 — 먼저 `gemma-translate llama-install`");
+    }
+    let gguf = pick_gguf_file()?;
+    let llama_port = 18000 + port as u32; // shim 이 바라보는 내부 포트
+
+    // llama-server 유닛
+    let llama_unit = format!("/etc/systemd/system/llama-server-gemma@{port}.service");
+    let llama = format!(r#"[Unit]
+Description=llama-server (TranslateGemma, GPU {gpu}, upstream :{llama_port})
+After=network.target
+
+[Service]
+Type=simple
+Environment="CUDA_VISIBLE_DEVICES={gpu}"
+ExecStart={server} --model {gguf} --host 127.0.0.1 --port {llama_port} \
+  --n-gpu-layers 999 --ctx-size 4096 --parallel 16 --cont-batching --flash-attn on --jinja
+Restart=on-failure
+RestartSec=10
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
+"#, server = LLAMA_SERVER_BIN);
+    fs::write(&llama_unit, llama)?;
+
+    // shim 유닛
+    let shim_unit = format!("/etc/systemd/system/{LLAMA_SHIM_UNIT_PREFIX}@{port}.service");
+    let shim = format!(r#"[Unit]
+Description=TranslateGemma shim (/translate → llama-server :{llama_port})
+After=llama-server-gemma@{port}.service
+Requires=llama-server-gemma@{port}.service
+
+[Service]
+Type=simple
+Environment="LLAMA_URL=http://127.0.0.1:{llama_port}"
+Environment="SHIM_PORT={port}"
+Environment="MODEL_NAME=translategemma-27b"
+ExecStart=/usr/bin/python3 {LLAMA_SHIM_PY}
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+"#);
+    fs::write(&shim_unit, shim)?;
+
+    sh(&["systemctl", "daemon-reload"])?;
+    sh(&["systemctl", "enable", "--now", &format!("llama-server-gemma@{port}.service")])?;
+    sh(&["systemctl", "enable", "--now", &format!("{LLAMA_SHIM_UNIT_PREFIX}@{port}.service")])?;
+    println!("기동: llama-server-gemma@{port} (GPU {gpu}, upstream :{llama_port}) + shim :{port}");
+    println!("확인: curl http://localhost:{port}/health");
+    Ok(())
+}
+
+fn llama_down(port: u16) -> Result<()> {
+    ensure_root()?;
+    for name in [
+        format!("{LLAMA_SHIM_UNIT_PREFIX}@{port}.service"),
+        format!("llama-server-gemma@{port}.service"),
+    ] {
+        let _ = Command::new("systemctl").args(["disable", "--now", &name]).status();
+        let _ = fs::remove_file(format!("/etc/systemd/system/{name}"));
+    }
+    sh(&["systemctl", "daemon-reload"])?;
+    println!("중지: port {port} (llama + shim)");
+    Ok(())
+}
+
+// ─── vLLM 백엔드 ───
+
+const VLLM_MODEL_ROOT: &str = "/opt/vllm/models";
+const VLLM_META_PATH: &str = "/etc/gemma-translate/vllm.json";
+const VLLM_VENV: &str = "/opt/translate-gemma/venv"; // transformers 와 공유 (이미 설치된 경우)
+
+#[derive(Serialize, Deserialize)]
+#[allow(dead_code)]
+struct VllmMeta {
+    model_dir: String,
+    repo: String,
+    quantization: String,
+}
+
+fn vllm_install(repo: &str, quantization: &str) -> Result<()> {
+    ensure_root()?;
+    let hf_token = std::env::var("HF_TOKEN").context("HF_TOKEN 필요 (Gemma 게이트)")?;
+
+    println!("[1/3] vLLM + 의존성 설치");
+    // 기존 venv 있으면 재사용, 없으면 만들기
+    if !Path::new(VLLM_VENV).exists() {
+        fs::create_dir_all("/opt/translate-gemma")?;
+        sh(&["python3", "-m", "venv", VLLM_VENV])?;
+    }
+    let pip = format!("{VLLM_VENV}/bin/pip");
+    sh(&[&pip, "install", "--upgrade", "pip", "--quiet"])?;
+    sh(&[&pip, "install", "--quiet",
+         "vllm", "huggingface_hub[cli]", "hf_transfer"])?;
+
+    println!("[2/3] 모델 다운로드: {repo}");
+    let safe_name = repo.replace('/', "-");
+    let model_dir = format!("{VLLM_MODEL_ROOT}/{safe_name}");
+    fs::create_dir_all(&model_dir)?;
+    let hf = format!("{VLLM_VENV}/bin/hf");
+    sh_env(
+        &[("HF_HUB_ENABLE_HF_TRANSFER", "1"), ("HF_TOKEN", &hf_token)],
+        &[&hf, "auth", "login", "--token", &hf_token, "--add-to-git-credential"],
+    ).ok();
+    sh_env(
+        &[("HF_HUB_ENABLE_HF_TRANSFER", "1"), ("HF_TOKEN", &hf_token)],
+        &[&hf, "download", repo, "--local-dir", &model_dir],
+    )?;
+
+    println!("[3/3] 메타데이터 저장: {VLLM_META_PATH}");
+    fs::create_dir_all("/etc/gemma-translate")?;
+    let meta = serde_json::json!({
+        "model_dir": &model_dir,
+        "repo": repo,
+        "quantization": quantization,
+    });
+    fs::write(VLLM_META_PATH, serde_json::to_string_pretty(&meta)?)?;
+
+    println!("\n설치 완료. 다음:");
+    println!("  gemma-translate vllm-up 0 8080          # GPU 0 단독");
+    println!("  gemma-translate vllm-up 0,1,2,3 8080    # TP=4 전체 분산");
+    Ok(())
+}
+
+fn vllm_meta() -> Result<(String, String)> {
+    let data = fs::read_to_string(VLLM_META_PATH)
+        .context("vllm meta 없음 — 먼저 `vllm-install`")?;
+    let v: serde_json::Value = serde_json::from_str(&data)?;
+    let model_dir = v["model_dir"].as_str().unwrap_or("").to_string();
+    let quant = v["quantization"].as_str().unwrap_or("none").to_string();
+    Ok((model_dir, quant))
+}
+
+fn vllm_up(gpus: &str, port: u16) -> Result<()> {
+    ensure_root()?;
+    let (model_dir, quantization) = vllm_meta()?;
+    let tp_size = gpus.split(',').count();
+    let unit_path = format!("/etc/systemd/system/translate-vllm@{port}.service");
+
+    let mut exec = format!(
+        "{venv}/bin/vllm serve {model} --host 0.0.0.0 --port {port} \
+         --tensor-parallel-size {tp}",
+        venv = VLLM_VENV, model = model_dir, tp = tp_size,
+    );
+    if quantization != "none" && !quantization.is_empty() {
+        exec.push_str(&format!(" --quantization {quantization}"));
+    }
+
+    let unit = format!(r#"[Unit]
+Description=vLLM TranslateGemma (GPUs={gpus}, TP={tp_size}, port={port})
+After=network.target
+
+[Service]
+Type=simple
+Environment="CUDA_VISIBLE_DEVICES={gpus}"
+ExecStart={exec}
+Restart=on-failure
+RestartSec=10
+LimitMEMLOCK=infinity
+
+[Install]
+WantedBy=multi-user.target
+"#);
+    fs::write(&unit_path, unit)?;
+    sh(&["systemctl", "daemon-reload"])?;
+    sh(&["systemctl", "enable", "--now", &format!("translate-vllm@{port}.service")])?;
+    println!("기동: translate-vllm@{port}  GPUs={gpus}  TP={tp_size}");
+    println!("확인: curl http://localhost:{port}/v1/models");
+    Ok(())
+}
+
+fn vllm_down(port: u16) -> Result<()> {
+    ensure_root()?;
+    let unit = format!("translate-vllm@{port}.service");
+    let _ = Command::new("systemctl").args(["disable", "--now", &unit]).status();
+    let _ = fs::remove_file(format!("/etc/systemd/system/{unit}"));
+    sh(&["systemctl", "daemon-reload"])?;
+    println!("중지: {unit}");
     Ok(())
 }
 
