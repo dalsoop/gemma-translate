@@ -275,8 +275,11 @@ const LLAMA_SHIM_UNIT_PREFIX: &str = "translate-llama";
 const SHIM_PY_CONTENTS: &str = r#"#!/usr/bin/env python3
 """llama-server (TranslateGemma) → /translate 호환 shim.
 
-llama-server 의 chat template 이 까다로워 --no-jinja 로 띄우고,
-shim 이 raw prompt 를 직접 빌드해 /completion 으로 호출한다."""
+Bug fixes:
+- 플레이스홀더 (%s, %d, {x}, [tag], <code>) 순서 보존 instruction
+- max_new_tokens 기본값 1024 (긴 문장 잘림 방지)
+- 구분자 (---) 제거 후처리
+"""
 import os
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
@@ -291,9 +294,17 @@ client = httpx.AsyncClient(timeout=120)
 
 
 def build_prompt(text: str, src: str, tgt: str) -> str:
+    rules = (
+        "Rules:\n"
+        "- Preserve all format placeholders exactly as-is in their original positions: "
+        "%s %d %i %f %x {0} {1} {name} ${var} [tag] [name] <code> <tag>.\n"
+        "- Preserve line breaks, leading/trailing whitespace, punctuation.\n"
+        "- Output ONLY the translation. No commentary, no quotes around it."
+    )
     return (
         "<start_of_turn>user\n"
-        f"Translate the following text from {src} to {tgt}.\n\n{text}\n"
+        f"Translate from {src} to {tgt}.\n{rules}\n\n"
+        f"---\n{text}\n---\n"
         "<end_of_turn>\n"
         "<start_of_turn>model\n"
     )
@@ -303,7 +314,7 @@ class Req(BaseModel):
     text: str
     source_lang_code: str = "en"
     target_lang_code: str = "ko"
-    max_new_tokens: int = 512
+    max_new_tokens: int = 1024
 
 
 @app.get("/health")
@@ -337,7 +348,10 @@ async def translate(r: Req):
         data = resp.json()
         if resp.status_code >= 400:
             raise HTTPException(500, f"llama: {data}")
-        return {"translation": data.get("content", "").strip()}
+        out = data.get("content", "").strip()
+        if out.startswith("---"): out = out[3:].lstrip()
+        if out.endswith("---"): out = out[:-3].rstrip()
+        return {"translation": out}
     except HTTPException:
         raise
     except Exception as e:
