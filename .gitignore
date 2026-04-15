@@ -1,6 +1,5 @@
-*.pyc
-__pycache__/
-.venv/
-venv/
-model/
+target/
+Cargo.lock
 *.log
+model/
+venv/
