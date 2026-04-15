@@ -1,87 +1,106 @@
 # gemma-translate
 
-Google **TranslateGemma 27B-IT** (Gemma 3 기반, 55개 언어) 셀프호스티드 번역 서버.
+Google **TranslateGemma 27B-IT** (Gemma 3, 55 언어) 셀프호스티드 번역 인프라.
 
-RTX 3090 한 장에 NF4 양자화로 27B 모델을 띄우고 여러 GPU 에 인스턴스를 분산시킵니다.
-설치/관리는 단일 **Rust 바이너리** (`gemma-translate`) 로 합니다.
+설치/관리는 단일 **Rust 바이너리** (`gemma-translate`) 로 합니다. 백엔드 3가지 지원:
+
+| 백엔드 | 특징 | 서브커맨드 |
+|--------|------|----------|
+| **transformers (NF4)** | Python + bitsandbytes 양자화. 단순. 0.3 req/s | `install` / `up` / `down` |
+| **llama.cpp (BF16 GGUF)** | C++ 추론, 4 GPU tensor-split, continuous batching. **3~10x 빠름** | `llama-install` / `llama-up` / `llama-down` |
+| **vLLM (BF16/AWQ)** | 최고 throughput. 셋업 복잡. | `vllm-install` / `vllm-up` / `vllm-down` |
 
 ## 요구사양
 
-- NVIDIA GPU (VRAM ≥ 16 GB per instance)
-- NVIDIA 드라이버 + CUDA 12.4
-- Python 3.10+ (서버 런타임용 — 설치 CLI가 venv 자동 관리)
+- NVIDIA GPU
+  - transformers NF4: VRAM ≥ 16 GB / 인스턴스
+  - llama.cpp BF16 (4 GPU 분산): VRAM ≥ 14 GB / 카드 × 4
+  - vLLM BF16: VRAM ≥ 16 GB / 카드 (TP=4 권장)
 - HuggingFace 계정 + [Gemma 라이선스 동의](https://huggingface.co/google/translategemma-27b-it)
-- Rust toolchain (설치 CLI 빌드용)
 
-## 설치
+## 설치 (Rust CLI)
 
 ```bash
 git clone https://github.com/dalsoop/gemma-translate.git
 cd gemma-translate/installer
-cargo build --release
-sudo install -m 0755 target/release/gemma-translate /usr/local/bin/
-
-# 모델 다운로드 + 공통 환경 구축 (~54 GB, 10~20분)
-sudo HF_TOKEN=hf_xxx gemma-translate install
+cargo build --release --target x86_64-unknown-linux-musl  # static
+sudo install -m 0755 target/x86_64-unknown-linux-musl/release/gemma-translate /usr/local/bin/
 ```
 
-## 인스턴스 기동
+## 백엔드별 사용
+
+### A. transformers (가장 단순)
 
 ```bash
-sudo gemma-translate up 0 8080    # GPU 0 → port 8080
+sudo HF_TOKEN=hf_xxx gemma-translate install
+sudo gemma-translate up 0 8080
 sudo gemma-translate up 1 8081
-sudo gemma-translate up 2 8082
-sudo gemma-translate up 3 8083
-
-gemma-translate list              # 설치 상태 + 실행중 인스턴스
-gemma-translate info 8080         # 특정 포트의 /info 조회
-
-sudo gemma-translate down 8080    # 중지
+gemma-translate info 8080
 ```
 
-`QUANT=int8` 또는 `QUANT=none` env 로 올리면 다른 양자화 사용 (`sudo QUANT=int8 gemma-translate up 0 8080`).
+### B. llama.cpp (가장 빠른 단일 모델)
 
-## CLI (`translate`) — 범용 번역
+```bash
+# 옵션 1: 사전 변환된 GGUF (bullerwins) 다운로드
+sudo HF_TOKEN=hf_xxx gemma-translate llama-install
+
+# 옵션 2: 기존 safetensors 를 BF16 GGUF 로 로컬 변환
+sudo gemma-translate llama-install --from-local /root/models/translategemma-27b-it
+
+# 4 GPU 분산 + shim 포함 기동
+sudo gemma-translate llama-up 0,1,2,3 8080
+
+# 단일 GPU
+sudo gemma-translate llama-up 0 8080
+
+curl http://localhost:8080/health
+```
+
+`llama-up` 은 자동으로 두 systemd 유닛 생성:
+- `llama-server-gemma@<port>.service` — llama-server (내부 :18080)
+- `translate-llama@<port>.service` — `/translate` 호환 shim
+
+### C. vLLM (PagedAttention)
+
+```bash
+sudo HF_TOKEN=hf_xxx gemma-translate vllm-install
+sudo gemma-translate vllm-up 0,1,2,3 8080   # TP=4
+```
+
+## /translate API (모든 백엔드 공통)
+
+```bash
+curl -X POST http://localhost:8080/translate \
+  -H 'Content-Type: application/json' \
+  -d '{"text":"Hello","source_lang_code":"en","target_lang_code":"ko"}'
+# {"translation":"안녕하세요"}
+```
+
+## 범용 CLI (`translate`)
 
 ```bash
 sudo cp cli/translate /usr/local/bin/translate
 
-export TRANSLATE_API="http://localhost:8080,http://localhost:8081,http://localhost:8082,http://localhost:8083"
+export TRANSLATE_API="http://localhost:8080"  # 여러 개면 쉼표구분 round-robin
 
 translate "Hello"
-translate -c "short UI button label, Korean noun form" "Save"
+translate -c "short UI button label" "Save"
 translate --list "Save,Cancel,Delete" -w 8
 translate -i en.json -o ko.json
 translate --po django.po
-translate -s en -t ja "Hello"
-```
-
-## HTTP API
-
-```bash
-# 번역
-curl -X POST http://localhost:8080/translate \
-  -H 'Content-Type: application/json' \
-  -d '{"text":"Hello","source_lang_code":"en","target_lang_code":"ko"}'
-# {"translation":"안녕하세요","elapsed_s":0.8}
-
-# 인스턴스 정보
-curl http://localhost:8080/info
-# {"model":"27b-it","quant":"nf4","vram_gb":16.29,...}
 ```
 
 ## 구조
 
 ```
 gemma-translate/
-├── installer/               Rust 설치/관리 CLI
-│   ├── Cargo.toml
-│   └── src/main.rs          install / up / down / list / info
+├── installer/            Rust CLI (clap + reqwest)
+│   └── src/main.rs       install/up/down/info  +  llama-* / vllm-*
 ├── server/
-│   ├── server.py            FastAPI + transformers (installer 가 embed)
+│   ├── server.py         transformers FastAPI 서버 (CLI 가 embed)
 │   └── requirements.txt
 ├── cli/
-│   └── translate            범용 번역 CLI (Python)
+│   └── translate         범용 번역 CLI (Python)
 └── README.md
 ```
 
