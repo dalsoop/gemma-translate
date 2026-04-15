@@ -219,21 +219,29 @@ fn down(port: u16) -> Result<()> {
 
 fn list() -> Result<()> {
     let root = root();
-    println!("루트: {}", root.display());
-    println!("모델 설치:   {}", root.join("model").exists());
-    println!("server.py:   {}", root.join("server.py").exists());
-    println!("venv:        {}", root.join("venv/bin/python").exists());
+    println!("── 설치 상태 ──");
+    println!("transformers 모델:  {}", if root.join("model").exists() { "✓" } else { "✗" });
+    println!("transformers venv:  {}", if root.join("venv/bin/python").exists() { "✓" } else { "✗" });
+    println!("llama.cpp server:   {}", if Path::new(LLAMA_SERVER_BIN).exists() { "✓" } else { "✗" });
+    println!("llama BF16 GGUF:    {}", if Path::new(LLAMA_GGUF_PATH).exists() { "✓" } else { "✗" });
+    println!("llama shim:         {}", if Path::new(LLAMA_SHIM_PY).exists() { "✓" } else { "✗" });
+    println!("vllm meta:          {}", if Path::new(VLLM_META_PATH).exists() { "✓" } else { "✗" });
     println!();
-    println!("── 실행중 인스턴스 ──");
-    let out = Command::new("systemctl")
-        .args(["list-units", "translate-gemma@*", "--no-legend"])
-        .output()?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    if text.trim().is_empty() {
-        println!("  (없음)");
-    } else {
-        for line in text.lines() {
-            println!("  {line}");
+
+    for (label, pattern) in &[
+        ("── transformers 인스턴스 ──", "translate-gemma@*.service"),
+        ("── llama.cpp 인스턴스 (backend + shim) ──", "llama-server-gemma@*.service translate-llama@*.service"),
+        ("── vLLM 인스턴스 ──", "translate-vllm@*.service"),
+    ] {
+        println!("{label}");
+        let args = std::iter::once("list-units").chain(
+            pattern.split_whitespace()).chain(std::iter::once("--no-legend")).collect::<Vec<_>>();
+        let out = Command::new("systemctl").args(&args).output()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        if text.trim().is_empty() {
+            println!("  (없음)");
+        } else {
+            for line in text.lines() { println!("  {line}"); }
         }
     }
     Ok(())
@@ -280,16 +288,30 @@ Bug fixes:
 - max_new_tokens 기본값 1024 (긴 문장 잘림 방지)
 - 구분자 (---) 제거 후처리
 """
-import os
-from fastapi import FastAPI, HTTPException
+import os, secrets
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 import httpx
 
 LLAMA_URL = os.environ.get("LLAMA_URL", "http://127.0.0.1:18080")
 MODEL_NAME = os.environ.get("MODEL_NAME", "translategemma-27b")
 SHIM_PORT = int(os.environ.get("SHIM_PORT", "8080"))
+API_KEY = os.environ.get("TRANSLATE_API_KEY", "")  # 비어있으면 auth 없음
 
 app = FastAPI()
+
+
+@app.middleware("http")
+async def auth_middleware(request: Request, call_next):
+    # /health 는 인증 없이 노출 (모니터링용)
+    if API_KEY and request.url.path not in ("/health", "/info"):
+        sent = request.headers.get("x-api-key", "") or \
+               request.headers.get("authorization", "").removeprefix("Bearer ").strip()
+        if not secrets.compare_digest(sent, API_KEY):
+            return JSONResponse(status_code=401, content={"detail": "invalid api key"})
+    return await call_next(request)
+
 client = httpx.AsyncClient(timeout=120)
 
 
@@ -366,6 +388,19 @@ if __name__ == "__main__":
 const LLAMA_GGUF_PATH: &str = "/opt/llama.cpp/models/translategemma-27b-bf16.gguf";
 
 // CUDA 런타임 라이브러리 경로 (PyTorch venv 가 있으면 그 안의 nvidia 패키지에서 가져옴)
+/// venv python3 가 있으면 그걸 쓰고, 없으면 시스템 /usr/bin/python3.
+/// `llama-install --from-local` 용 transformers 모듈이 있는 venv 찾을 때 사용.
+fn find_python() -> String {
+    let candidates = [
+        "/root/venv/bin/python3",
+        "/opt/translate-gemma/venv/bin/python3",
+        "/opt/llama.cpp/venv/bin/python3",
+    ];
+    candidates.iter().find(|p| Path::new(p).exists())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "/usr/bin/python3".into())
+}
+
 fn cuda_ld_path() -> String {
     let candidates = [
         "/root/venv/lib/python3.11/site-packages/nvidia",
@@ -410,9 +445,18 @@ fn llama_install(repo: &str, quant_pattern: &str, from_local: Option<&str>) -> R
             bail!("로컬 모델 디렉토리 없음: {src}");
         }
         println!("[2/3] 로컬 safetensors → BF16 GGUF 변환");
+        let python = find_python();
         println!("  src: {src}");
         println!("  out: {LLAMA_GGUF_PATH}");
-        sh(&["python3", &convert_py, src,
+        println!("  python: {python}");
+        // convert 가 transformers 를 요구하니 해당 venv 에 없으면 설치 시도
+        sh(&[&format!("{}/bin/pip", python.trim_end_matches("/bin/python3")),
+             "install", "--quiet", "transformers", "gguf", "sentencepiece", "protobuf"])
+            .or_else(|_| sh(&["pip", "install", "--quiet", "--break-system-packages",
+                              "transformers", "gguf", "sentencepiece", "protobuf"]))
+            .or_else(|_| sh(&["pip", "install", "--quiet",
+                              "transformers", "gguf", "sentencepiece", "protobuf"])).ok();
+        sh(&[&python, &convert_py, src,
              "--outtype", "bf16",
              "--outfile", LLAMA_GGUF_PATH])?;
     } else {
@@ -501,19 +545,26 @@ WantedBy=multi-user.target
 "#, server = LLAMA_SERVER_BIN);
     fs::write(&llama_unit, llama)?;
 
-    // shim 유닛
+    // shim 유닛 — upstream ready 까지 대기 + API key 지원
+    let api_key_env = std::env::var("TRANSLATE_API_KEY").unwrap_or_default();
+    let python_bin = find_python();
     let shim_unit = format!("/etc/systemd/system/{LLAMA_SHIM_UNIT_PREFIX}@{port}.service");
     let shim = format!(r#"[Unit]
 Description=TranslateGemma shim (/translate → llama-server :{llama_port})
 After=llama-server-gemma@{port}.service
 Requires=llama-server-gemma@{port}.service
+# upstream 이 늦게 떠도 shim 이 health loop 로 기다림 (ExecStartPre)
 
 [Service]
 Type=simple
 Environment="LLAMA_URL=http://127.0.0.1:{llama_port}"
 Environment="SHIM_PORT={port}"
 Environment="MODEL_NAME=translategemma-27b"
-ExecStart=/usr/bin/python3 {LLAMA_SHIM_PY}
+Environment="TRANSLATE_API_KEY={api_key_env}"
+ExecStartPre=/bin/bash -c 'for i in $(seq 1 120); do \
+  curl -sf http://127.0.0.1:{llama_port}/health >/dev/null 2>&1 && exit 0; sleep 2; done; \
+  echo "upstream timeout"; exit 1'
+ExecStart={python_bin} {LLAMA_SHIM_PY}
 Restart=on-failure
 RestartSec=5
 
