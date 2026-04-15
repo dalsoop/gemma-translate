@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""
+phs-translate — 범용 청크 번역 CLI (TranslateGemma 27B 백엔드)
+
+사용:
+  phs-translate "Hello world"                   # 단일 문장
+  phs-translate -i file.txt -o out.txt          # 텍스트 파일 (한 줄 = 한 청크)
+  phs-translate -i strings.json -o ko.json      # JSON {key:value} 전부 번역
+  phs-translate --po django.po                  # .po 빈 msgstr 채움 (in-place, resumable)
+  phs-translate -s en -t ja ...                 # 언어 변경
+  phs-translate --list "Save,Cancel,Delete"     # 쉼표구분 리스트
+
+특징:
+  - 청크 분할: 기본 1개 요청/문장. JSON/list는 병렬 (기본 4 워커)
+  - 체크포인트: out 파일 라인 수 보고 이어받기
+  - 재시도: 각 청크 최대 3회
+"""
+import argparse, json, os, re, sys, time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+
+try:
+    import urllib.request as u
+except ImportError:
+    sys.exit("python3 표준 라이브러리 실패")
+
+DEFAULT_API = os.environ.get("TRANSLATE_API", "http://10.0.60.108:8080")
+
+
+import threading
+_api_counter = threading.Lock()
+_api_idx = [0]
+
+def _pick_api(api: str) -> str:
+    """Round-robin over comma-separated endpoints."""
+    urls = [u.strip() for u in api.split(",") if u.strip()]
+    if len(urls) == 1:
+        return urls[0]
+    with _api_counter:
+        _api_idx[0] = (_api_idx[0] + 1) % len(urls)
+        return urls[_api_idx[0]]
+
+
+def translate_one(text: str, src: str, tgt: str, api: str,
+                  retries: int = 3, timeout: int = 60, context: str = "") -> str:
+    if not text or not text.strip():
+        return text
+    if context:
+        payload_text = f"[context: {context}] {text}"
+    else:
+        payload_text = text
+    payload = json.dumps({
+        "text": payload_text, "source_lang_code": src, "target_lang_code": tgt,
+    }).encode("utf-8")
+    last_err = None
+    for attempt in range(retries):
+        url = _pick_api(api)
+        try:
+            req = u.Request(f"{url}/translate", data=payload,
+                            headers={"Content-Type": "application/json"}, method="POST")
+            with u.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read())
+                return data["translation"]
+        except Exception as e:
+            last_err = e
+            time.sleep(1 + attempt * 2)
+    raise RuntimeError(f"translation failed after {retries}: {last_err}")
+
+
+def _pbar(done: int, total: int, t0: float) -> None:
+    elapsed = time.time() - t0
+    rate = done / elapsed if elapsed > 0 else 0
+    eta = (total - done) / rate if rate > 0 else 0
+    sys.stderr.write(
+        f"\r  {done}/{total} ({done*100//max(total,1)}%)  "
+        f"{rate:.1f}/s  eta={int(eta)}s"
+    )
+    sys.stderr.flush()
+
+
+def translate_list(items, src, tgt, api, workers=4, skip_empty=True, context=""):
+    """병렬 번역 + 원 순서 유지."""
+    results = [None] * len(items)
+    t0 = time.time()
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {}
+        for i, it in enumerate(items):
+            if skip_empty and (not it or not str(it).strip()):
+                results[i] = it
+                done += 1
+                continue
+            futs[ex.submit(translate_one, str(it), src, tgt, api, 3, 60, context)] = i
+        for f in as_completed(futs):
+            i = futs[f]
+            try:
+                results[i] = f.result()
+            except Exception as e:
+                sys.stderr.write(f"\n[warn] idx={i} failed: {e}\n")
+                results[i] = items[i]  # keep original on fail
+            done += 1
+            _pbar(done, len(items), t0)
+    sys.stderr.write("\n")
+    return results
+
+
+def mode_po(path: Path, src: str, tgt: str, api: str, workers: int, context: str = ""):
+    """gettext .po 파일 in-place 번역 (빈 msgstr만 채움)."""
+    text = path.read_text(encoding="utf-8")
+    entries = re.findall(r'(msgid\s+((?:"[^"]*"\s*)+))\s*(msgstr\s+((?:"[^"]*"\s*)+))',
+                         text, re.MULTILINE)
+    pending = []
+    for _, msgid_q, _, msgstr_q in entries:
+        mid = "".join(re.findall(r'"([^"]*)"', msgid_q))
+        mstr = "".join(re.findall(r'"([^"]*)"', msgstr_q))
+        if mid and not mstr:
+            pending.append((mid, msgid_q, msgstr_q))
+    if not pending:
+        print("모든 msgid 이미 번역되어 있음.")
+        return
+    print(f".po: {len(pending)}개 빈 msgstr 번역 시작")
+    translations = translate_list([p[0] for p in pending], src, tgt, api, workers, context=context)
+    for (mid, msgid_q, msgstr_q), tr in zip(pending, translations):
+        esc = tr.replace("\\", "\\\\").replace('"', '\\"')
+        new_msgstr = f'msgstr "{esc}"'
+        # msgid 다음의 msgstr 블록 치환 — 첫 매칭만
+        pattern = re.compile(re.escape(msgid_q) + r'\s*' + re.escape(msgstr_q))
+        text = pattern.sub(msgid_q.rstrip() + "\n" + new_msgstr, text, count=1)
+    path.write_text(text, encoding="utf-8")
+    print(f".po 저장: {path}")
+
+
+def mode_json(src_path: Path, dst_path: Path, src: str, tgt: str, api: str, workers: int, context: str = ""):
+    data = json.loads(src_path.read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        sys.exit("JSON 모드는 {key:value} 객체만 지원")
+    keys = list(data.keys())
+    vals = [str(data[k]) for k in keys]
+    print(f"JSON: {len(vals)}개 값 번역")
+    out_vals = translate_list(vals, src, tgt, api, workers, context=context)
+    out = dict(zip(keys, out_vals))
+    dst_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"저장: {dst_path}")
+
+
+def mode_text(src_path: Path | None, dst_path: Path | None, src: str, tgt: str,
+              api: str, workers: int, context: str = ""):
+    lines = (src_path.read_text(encoding="utf-8") if src_path else sys.stdin.read()).splitlines()
+    # resume: 기존 out 라인 수만큼 스킵
+    already = 0
+    if dst_path and dst_path.exists():
+        already = len(dst_path.read_text(encoding="utf-8").splitlines())
+        if already >= len(lines):
+            print(f"이미 완료됨 ({already}줄)")
+            return
+        print(f"체크포인트: {already}/{len(lines)}줄 완료, 이어서 진행")
+    pending = lines[already:]
+    out = translate_list(pending, src, tgt, api, workers, context=context)
+    mode = "a" if already and dst_path else "w"
+    if dst_path:
+        with open(dst_path, mode, encoding="utf-8") as f:
+            for line in out:
+                f.write(line + "\n")
+        print(f"저장: {dst_path}")
+    else:
+        for line in out:
+            print(line)
+
+
+def main():
+    p = argparse.ArgumentParser(prog="phs-translate",
+                                formatter_class=argparse.RawDescriptionHelpFormatter,
+                                description=__doc__)
+    p.add_argument("text", nargs="?", help="번역할 텍스트(단일)")
+    p.add_argument("-i", "--input", help="입력 파일")
+    p.add_argument("-o", "--output", help="출력 파일 (text 모드 이어받기 지원)")
+    p.add_argument("--po", help=".po 파일 in-place 번역")
+    p.add_argument("--list", help="쉼표구분 리스트")
+    p.add_argument("-s", "--source", default="en", help="원본 언어코드 (기본 en)")
+    p.add_argument("-t", "--target", default="ko", help="대상 언어코드 (기본 ko)")
+    p.add_argument("--api", default=DEFAULT_API, help=f"API URL (기본 {DEFAULT_API})")
+    p.add_argument("-w", "--workers", type=int, default=4, help="병렬 워커 수 (기본 4)")
+    p.add_argument("-c", "--context", default="", help='짧은 UI 텍스트 문맥 힌트 (예: "UI button")')
+    args = p.parse_args()
+
+    # dispatch
+    if args.po:
+        mode_po(Path(args.po), args.source, args.target, args.api, args.workers, args.context)
+    elif args.list:
+        items = [s.strip() for s in args.list.split(",")]
+        res = translate_list(items, args.source, args.target, args.api, args.workers, context=args.context)
+        for src_t, tr in zip(items, res):
+            print(f"{src_t}\t→\t{tr}")
+    elif args.input and args.input.endswith(".json"):
+        mode_json(Path(args.input), Path(args.output or args.input + ".translated.json"),
+                  args.source, args.target, args.api, args.workers, args.context)
+    elif args.input or not args.text:
+        mode_text(Path(args.input) if args.input else None,
+                  Path(args.output) if args.output else None,
+                  args.source, args.target, args.api, args.workers, args.context)
+    else:
+        # 단일 번역
+        print(translate_one(args.text, args.source, args.target, args.api, context=args.context))
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.stderr.write("\n중단됨\n")
+        sys.exit(130)

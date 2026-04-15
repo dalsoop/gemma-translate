@@ -1,0 +1,9 @@
+torch==2.5.1
+transformers>=4.50
+accelerate
+sentencepiece
+bitsandbytes
+huggingface_hub
+hf_transfer
+fastapi
+uvicorn
