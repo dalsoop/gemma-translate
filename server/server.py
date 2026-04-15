@@ -1,7 +1,12 @@
 """
-TranslateGemma 27B-IT — 번역 전용 서버
-단일 RTX 3090 (GPU 2) + bitsandbytes NF4
-chat template 요구 포맷: source_lang_code + target_lang_code + text
+TranslateGemma 번역 서버 — 4b-it / 27b-it / (원하는 다른 repo) 공용.
+
+환경변수:
+  MODEL_DIR    모델 로컬 경로 (install.sh 가 설정)
+  MODEL_NAME   프로파일 이름 (로그/메트릭용, 예: "27b-it-nf4")
+  TRANSLATE_PORT  리스닝 포트 (기본 8080)
+  CUDA_VISIBLE_DEVICES  GPU 인덱스
+  QUANT        "nf4" (default) | "none" | "int8"
 """
 import os, time, logging
 import torch
@@ -9,35 +14,41 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from transformers import AutoTokenizer, Gemma3ForConditionalGeneration, BitsAndBytesConfig
 
-os.environ.setdefault("CUDA_VISIBLE_DEVICES", "2")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("translate")
 
 MODEL_DIR = os.environ.get("MODEL_DIR", "/opt/translate-gemma/model")
+MODEL_NAME = os.environ.get("MODEL_NAME", os.path.basename(MODEL_DIR.rstrip("/")))
+QUANT = os.environ.get("QUANT", "nf4").lower()
 
+log.info("model=%s  dir=%s  quant=%s", MODEL_NAME, MODEL_DIR, QUANT)
 log.info("loading tokenizer…")
 tok = AutoTokenizer.from_pretrained(MODEL_DIR)
 
-log.info("loading model (NF4 quant)…")
+log.info("loading model…")
 t0 = time.time()
-bnb = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16,
-    bnb_4bit_use_double_quant=True,
-)
-model = Gemma3ForConditionalGeneration.from_pretrained(
-    MODEL_DIR, quantization_config=bnb, device_map="auto", dtype=torch.bfloat16
-).eval()
-log.info("loaded in %.1fs  vram=%.2f GB", time.time() - t0,
-         torch.cuda.memory_allocated() / 1e9)
+kwargs = {"device_map": "auto", "dtype": torch.bfloat16}
+if QUANT == "nf4":
+    kwargs["quantization_config"] = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+    )
+elif QUANT == "int8":
+    kwargs["quantization_config"] = BitsAndBytesConfig(load_in_8bit=True)
+# QUANT=none → 풀 BF16
+model = Gemma3ForConditionalGeneration.from_pretrained(MODEL_DIR, **kwargs).eval()
+LOAD_TIME_S = time.time() - t0
+VRAM_GB = round(torch.cuda.memory_allocated() / 1e9, 2)
+log.info("loaded in %.1fs  vram=%s GB", LOAD_TIME_S, VRAM_GB)
 
-app = FastAPI(title="TranslateGemma 27B")
+app = FastAPI(title=f"TranslateGemma ({MODEL_NAME})")
 
 
 class Req(BaseModel):
     text: str
-    source_lang_code: str = "en"    # BCP-47 like "en", "ko", "ja", "zh-CN"
+    source_lang_code: str = "en"
     target_lang_code: str = "ko"
     max_new_tokens: int = 512
 
@@ -45,6 +56,19 @@ class Req(BaseModel):
 @app.get("/health")
 def health():
     return {"ok": True, "vram_gb": round(torch.cuda.memory_allocated() / 1e9, 2)}
+
+
+@app.get("/info")
+def info():
+    return {
+        "model": MODEL_NAME,
+        "model_dir": MODEL_DIR,
+        "quant": QUANT,
+        "vram_gb": round(torch.cuda.memory_allocated() / 1e9, 2),
+        "load_time_s": round(LOAD_TIME_S, 2),
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", ""),
+        "port": int(os.environ.get("TRANSLATE_PORT", 8080)),
+    }
 
 
 @app.post("/translate")
@@ -66,8 +90,7 @@ def translate(r: Req):
     ).to(model.device)
     t0 = time.time()
     with torch.inference_mode():
-        out = model.generate(**enc, max_new_tokens=r.max_new_tokens,
-                             do_sample=False)
+        out = model.generate(**enc, max_new_tokens=r.max_new_tokens, do_sample=False)
     input_len = enc["input_ids"].shape[-1]
     gen = out[0][input_len:]
     text = tok.decode(gen, skip_special_tokens=True).strip()
