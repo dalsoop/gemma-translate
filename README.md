@@ -1,110 +1,148 @@
 # gemma-translate
 
-Google **TranslateGemma 27B-IT** (Gemma 3, 55 언어) 셀프호스티드 번역 인프라.
-
-설치/관리는 단일 **Rust 바이너리** (`gemma-translate`) 로 합니다. 백엔드 3가지 지원:
-
-| 백엔드 | 특징 | 서브커맨드 |
-|--------|------|----------|
-| **transformers (NF4)** | Python + bitsandbytes 양자화. 단순. 0.3 req/s | `install` / `up` / `down` |
-| **llama.cpp (BF16 GGUF)** | C++ 추론, 4 GPU tensor-split, continuous batching. **3~10x 빠름** | `llama-install` / `llama-up` / `llama-down` |
-| **vLLM (BF16/AWQ)** | 최고 throughput. 셋업 복잡. | `vllm-install` / `vllm-up` / `vllm-down` |
-
-## 요구사양
-
-- NVIDIA GPU
-  - transformers NF4: VRAM ≥ 16 GB / 인스턴스
-  - llama.cpp BF16 (4 GPU 분산): VRAM ≥ 14 GB / 카드 × 4
-  - vLLM BF16: VRAM ≥ 16 GB / 카드 (TP=4 권장)
-- HuggingFace 계정 + [Gemma 라이선스 동의](https://huggingface.co/google/translategemma-27b-it)
-
-## 설치 (Rust CLI)
+Self-hosted translation infrastructure powered by Google **TranslateGemma 27B-IT** (Gemma 3, 55 languages).
+Single Rust binary manages install/start/stop across **three backends**: transformers, **llama.cpp (recommended)**, and vLLM.
 
 ```bash
-git clone https://github.com/dalsoop/gemma-translate.git
-cd gemma-translate/installer
-cargo build --release --target x86_64-unknown-linux-musl  # static
-sudo install -m 0755 target/x86_64-unknown-linux-musl/release/gemma-translate /usr/local/bin/
-```
+# 1. Install
+cargo install --git https://github.com/dalsoop/gemma-translate --path installer
+sudo HF_TOKEN=hf_xxx gemma-translate llama-install \
+  --from-local /path/to/translategemma-27b-it   # or let it download
 
-## 백엔드별 사용
-
-### A. transformers (가장 단순)
-
-```bash
-sudo HF_TOKEN=hf_xxx gemma-translate install
-sudo gemma-translate up 0 8080
-sudo gemma-translate up 1 8081
-gemma-translate info 8080
-```
-
-### B. llama.cpp (가장 빠른 단일 모델)
-
-```bash
-# 옵션 1: 사전 변환된 GGUF (bullerwins) 다운로드
-sudo HF_TOKEN=hf_xxx gemma-translate llama-install
-
-# 옵션 2: 기존 safetensors 를 BF16 GGUF 로 로컬 변환
-sudo gemma-translate llama-install --from-local /root/models/translategemma-27b-it
-
-# 4 GPU 분산 + shim 포함 기동
+# 2. Run (4 GPU tensor-split)
 sudo gemma-translate llama-up 0,1,2,3 8080
 
-# 단일 GPU
-sudo gemma-translate llama-up 0 8080
-
-curl http://localhost:8080/health
-```
-
-`llama-up` 은 자동으로 두 systemd 유닛 생성:
-- `llama-server-gemma@<port>.service` — llama-server (내부 :18080)
-- `translate-llama@<port>.service` — `/translate` 호환 shim
-
-### C. vLLM (PagedAttention)
-
-```bash
-sudo HF_TOKEN=hf_xxx gemma-translate vllm-install
-sudo gemma-translate vllm-up 0,1,2,3 8080   # TP=4
-```
-
-## /translate API (모든 백엔드 공통)
-
-```bash
+# 3. Translate
 curl -X POST http://localhost:8080/translate \
   -H 'Content-Type: application/json' \
-  -d '{"text":"Hello","source_lang_code":"en","target_lang_code":"ko"}'
-# {"translation":"안녕하세요"}
+  -d '{"text":"Hello, world!","source_lang_code":"en","target_lang_code":"ko"}'
+# {"translation":"안녕하세요, 세상!"}
 ```
 
-## 범용 CLI (`translate`)
+## Features
+
+- **Single Rust CLI** manages everything (install, start, stop, model switch)
+- **3 interchangeable backends**
+  - `transformers` + NF4 — simplest
+  - `llama.cpp` + BF16 GGUF — best throughput with continuous batching (**~2 req/s on 4× RTX 3090**)
+  - `vLLM` + BF16/AWQ — tensor-parallel
+- **Glossary**: standardized translations bypass the model (Save→저장 always)
+- **API key auth** (optional, set `TRANSLATE_API_KEY`)
+- **Placeholder preservation**: `%s`, `%d`, `{name}`, `${var}`, `[tag]`, `<code>` kept in position
+- **systemd**-managed, auto-restart, upstream-ready gate
+- **OpenAI-style** HTTP API on top of llama.cpp
+
+## Requirements
+
+- NVIDIA GPU
+  - transformers NF4: ≥16 GB VRAM per instance
+  - llama.cpp BF16 split across 4 GPUs: ≥14 GB per card
+- NVIDIA driver + CUDA 12.4
+- Python 3.10+ (for shim + server)
+- Rust toolchain (to build the CLI)
+- HuggingFace account with [Gemma license](https://huggingface.co/google/translategemma-27b-it) accepted
+
+## Commands
 
 ```bash
-sudo cp cli/translate /usr/local/bin/translate
+# Installation
+gemma-translate install                      # transformers backend
+gemma-translate llama-install [--from-local DIR]
+gemma-translate vllm-install
 
-export TRANSLATE_API="http://localhost:8080"  # 여러 개면 쉼표구분 round-robin
+# Instance control (per port)
+gemma-translate up|llama-up|vllm-up GPUS PORT
+gemma-translate down|llama-down|vllm-down PORT
+gemma-translate list
+gemma-translate info PORT
 
-translate "Hello"
-translate -c "short UI button label" "Save"
-translate --list "Save,Cancel,Delete" -w 8
-translate -i en.json -o ko.json
-translate --po django.po
+# Glossary (standardized terms)
+gemma-translate glossary add "Save" "저장" --target ko
+gemma-translate glossary import ui-terms.json --target ko [--overwrite]
+gemma-translate glossary export [--out file.json]
+gemma-translate glossary list [--target ko]
+gemma-translate glossary remove "Save" --target ko
 ```
 
-## 구조
+## API
+
+`POST /translate`
+```json
+{
+  "text": "Hello world",
+  "source_lang_code": "en",
+  "target_lang_code": "ko",
+  "max_new_tokens": 1024
+}
+```
+
+Response:
+```json
+{ "translation": "안녕하세요 세상" }
+// or glossary hit:
+{ "translation": "저장", "source": "glossary" }
+```
+
+`GET /health`, `GET /info` — monitoring / metadata.
+
+## Authentication
+
+Set `TRANSLATE_API_KEY` before `llama-up`:
+```bash
+export TRANSLATE_API_KEY=$(openssl rand -hex 24)
+sudo -E gemma-translate llama-up 0,1,2,3 8080
+```
+Clients must send `X-API-Key: <key>` or `Authorization: Bearer <key>`.
+
+## Repository Layout
 
 ```
 gemma-translate/
-├── installer/            Rust CLI (clap + reqwest)
-│   └── src/main.rs       install/up/down/info  +  llama-* / vllm-*
+├── installer/          Rust CLI (clap + reqwest)
+│   └── src/main.rs     install/up/down/list/info + llama-* + vllm-* + glossary
 ├── server/
-│   ├── server.py         transformers FastAPI 서버 (CLI 가 embed)
+│   ├── server.py       transformers FastAPI server (embedded in CLI)
 │   └── requirements.txt
 ├── cli/
-│   └── translate         범용 번역 CLI (Python)
+│   └── translate       Universal translate CLI (Python)
 └── README.md
 ```
 
-## 라이선스
+## License
 
-- TranslateGemma 모델: [Gemma Terms of Use](https://ai.google.dev/gemma/terms)
-- 이 리포지토리 코드: MIT
+- Code: **MIT**
+- TranslateGemma model: [Gemma Terms of Use](https://ai.google.dev/gemma/terms)
+
+---
+
+## 한국어
+
+(아래는 한국어 버전입니다. 영문과 동일.)
+
+### 설치
+```bash
+cargo install --git https://github.com/dalsoop/gemma-translate --path installer
+sudo HF_TOKEN=hf_xxx gemma-translate llama-install \
+  --from-local /path/to/translategemma-27b-it
+sudo gemma-translate llama-up 0,1,2,3 8080
+```
+
+### 특징
+- 단일 Rust CLI 로 3개 백엔드 (transformers / llama.cpp / vLLM) 전환
+- 글로서리 (표준 번역 사전) — `Save` 는 항상 `저장`
+- 플레이스홀더 (`%s`, `{name}` 등) 위치 보존
+- API 키 인증 옵션 (`TRANSLATE_API_KEY`)
+- systemd 자동 기동 + upstream ready 대기
+
+### 백엔드 선택
+| 백엔드 | 처리량 | 특징 |
+|-------|-------|------|
+| transformers + NF4 | ~0.3 req/s | 단순, GPU 당 1 인스턴스 |
+| **llama.cpp + BF16 GGUF** | **~2 req/s** | 4 GPU tensor-split + continuous batching |
+| vLLM | 변동 | PagedAttention, 셋업 복잡 |
+
+자세한 명령은 `gemma-translate --help` 참고.
+
+## Links
+- Related: [translate-dashboard](https://github.com/dalsoop/translate-dashboard) (Ratatui TUI)
+- Example output: [sentry-korean-locale](https://github.com/dalsoop/sentry-korean-locale) (Sentry ko.js 15,173 entries)

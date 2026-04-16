@@ -1,0 +1,62 @@
+# docker-compose example (GPU passthrough via NVIDIA Container Toolkit)
+#
+# Note: this compose file expects you to have:
+#   1. docker + docker compose + nvidia-container-toolkit installed on the host
+#   2. TranslateGemma model already downloaded (set MODEL_HOST_PATH)
+#   3. The gemma-translate Rust binary is NOT used here; we run llama-server
+#      + a small shim directly via docker. For the full CLI-managed systemd
+#      setup, use `gemma-translate llama-install && llama-up` on bare metal.
+#
+# Usage:
+#   cp compose.example.yml compose.yml
+#   # edit MODEL_HOST_PATH
+#   docker compose up -d
+#   curl http://localhost:8080/translate -d '{"text":"Hello","source_lang_code":"en","target_lang_code":"ko"}'
+
+services:
+  llama-server:
+    image: ghcr.io/ggerganov/llama.cpp:server-cuda
+    command: >
+      --model /models/translategemma-27b-bf16.gguf
+      --host 0.0.0.0 --port 18080
+      --n-gpu-layers 999 --tensor-split 1,1,1,1
+      --parallel 16 --cont-batching --flash-attn on
+      --no-jinja --chat-template chatml --ctx-size 65536
+    volumes:
+      - ${MODEL_HOST_PATH:-./model}:/models:ro
+    ports:
+      - "18080:18080"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:18080/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 40
+      start_period: 180s
+
+  shim:
+    image: python:3.11-slim
+    working_dir: /app
+    command: >
+      bash -c "pip install -q fastapi httpx uvicorn pydantic &&
+               python /app/shim.py"
+    volumes:
+      - ./server/shim.py:/app/shim.py:ro
+      - ${GLOSSARY_HOST_PATH:-./glossary.json}:/etc/gemma-translate/glossary.json:ro
+    environment:
+      LLAMA_URL: http://llama-server:18080
+      SHIM_PORT: "8080"
+      TRANSLATE_API_KEY: ${TRANSLATE_API_KEY:-}
+    ports:
+      - "8080:8080"
+    depends_on:
+      llama-server:
+        condition: service_healthy
+    restart: unless-stopped
