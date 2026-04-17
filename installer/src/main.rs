@@ -58,7 +58,17 @@ enum Cmd {
         from_local: Option<String>,
     },
     /// llama.cpp 인스턴스 기동: llama-up <gpu_list> <port>  (예: "0,1,2,3")
-    LlamaUp { gpus: String, port: u16 },
+    /// --replicas N 이면 GPU 당 독립 인스턴스 (port 부터 N개 연속 포트)
+    LlamaUp {
+        gpus: String,
+        port: u16,
+        /// GPU 당 독립 인스턴스 기동 (예: --replicas 4 → 8080~8083, GPU 0~3 각각)
+        #[arg(long)]
+        replicas: Option<u32>,
+        /// 슬롯 당 context 크기 (기본 2048). parallel × per_slot = 총 ctx
+        #[arg(long, default_value_t = 2048)]
+        ctx_per_slot: u32,
+    },
     /// llama.cpp 인스턴스 중지
     LlamaDown { port: u16 },
 
@@ -117,7 +127,7 @@ fn main() -> Result<()> {
         Cmd::List => list(),
         Cmd::Info { port } => info(port),
         Cmd::LlamaInstall { repo, quant, from_local } => llama_install(&repo, &quant, from_local.as_deref()),
-        Cmd::LlamaUp { gpus, port } => llama_up(&gpus, port),
+        Cmd::LlamaUp { gpus, port, replicas, ctx_per_slot } => llama_up(&gpus, port, replicas, ctx_per_slot),
         Cmd::LlamaDown { port } => llama_down(port),
         Cmd::VllmInstall { repo, quantization } => vllm_install(&repo, &quantization),
         Cmd::VllmUp { gpus, port } => vllm_up(&gpus, port),
@@ -690,21 +700,78 @@ fn pick_gguf() -> Result<String> {
         .map(|(p, _)| p.to_string_lossy().to_string())
 }
 
-fn llama_up(gpus: &str, port: u16) -> Result<()> {
+/// GPU VRAM 여유 체크 (nvidia-smi). 부족하면 경고.
+fn check_gpu_vram(gpu_id: &str, needed_mb: u32) {
+    let out = Command::new("nvidia-smi")
+        .args(["--query-gpu=memory.free", "--format=csv,noheader,nounits", &format!("-i{gpu_id}")])
+        .output();
+    if let Ok(o) = out {
+        let free: u32 = String::from_utf8_lossy(&o.stdout).trim().parse().unwrap_or(0);
+        if free < needed_mb {
+            eprintln!("⚠ GPU {gpu_id}: {free} MiB free, ~{needed_mb} MiB 필요. 다른 프로세스가 VRAM 점유 중일 수 있음.");
+            eprintln!("  확인: nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv");
+        }
+    }
+}
+
+fn llama_up(gpus: &str, port: u16, replicas: Option<u32>, ctx_per_slot: u32) -> Result<()> {
     ensure_root()?;
     if !Path::new(LLAMA_SHIM_PY).exists() {
         bail!("shim 없음 — 먼저 `gemma-translate llama-install`");
     }
     let gguf = pick_gguf()?;
-    let llama_port = 18000 + port as u32; // shim 이 바라보는 내부 포트
-    let tp_size = gpus.split(',').count();
-    let tensor_split = vec!["1"; tp_size].join(",");
     let ld_path = cuda_ld_path();
+    let gpu_list: Vec<&str> = gpus.split(',').map(str::trim).collect();
+
+    // --replicas 모드: GPU 당 독립 인스턴스 (데이터 병렬)
+    if let Some(n) = replicas {
+        let n = n as usize;
+        if n > gpu_list.len() {
+            bail!("replicas ({n}) > GPU 수 ({}). GPU 리스트: {gpus}", gpu_list.len());
+        }
+        println!("=== replicas 모드: {n}개 독립 인스턴스 ===");
+        let parallel: u32 = 4; // 독립 인스턴스는 parallel 작게
+        let ctx_size = parallel * ctx_per_slot;
+        for i in 0..n {
+            let gpu = gpu_list[i];
+            let p = port + i as u16;
+            let lp = 18000 + p as u32;
+            println!("[{}/{}] GPU {} → :{p} (llama :{lp}, ctx={ctx_size}, parallel={parallel})", i+1, n, gpu);
+            check_gpu_vram(gpu, 18000); // Q4_K_M ~16GB + KV cache
+            create_llama_units(gpu, "1", p, lp, &gguf, &ld_path, ctx_size, parallel)?;
+        }
+        println!("\n{n}개 인스턴스 기동 완료.");
+        println!("round-robin: TRANSLATE_API=http://localhost:{port},...,http://localhost:{}", port + n as u16 - 1);
+        return Ok(());
+    }
+
+    // 기존 모드: tensor-split (단일 인스턴스, 멀티 GPU)
+    let tp_size = gpu_list.len();
+    let tensor_split = vec!["1"; tp_size].join(",");
+    let llama_port = 18000 + port as u32;
+    for g in &gpu_list { check_gpu_vram(g, 14000); }
+    let parallel: u32 = 16;
+    let ctx_size = parallel * ctx_per_slot;
+
+    println!("GPU={gpus} tensor-split={tensor_split} ctx={ctx_size} parallel={parallel}");
+    create_llama_units(gpus, &tensor_split, port, llama_port, &gguf, &ld_path, ctx_size, parallel)?;
+    println!("확인: curl http://localhost:{port}/health");
+    Ok(())
+}
+
+fn create_llama_units(
+    gpus: &str, tensor_split: &str, port: u16, llama_port: u32,
+    gguf: &str, ld_path: &str, ctx_size: u32, parallel: u32,
+) -> Result<()> {
+    let api_key_env = std::env::var("TRANSLATE_API_KEY").unwrap_or_default();
+    let python_bin = find_python();
 
     let llama_unit = format!("/etc/systemd/system/llama-server-gemma@{port}.service");
     let llama = format!(r#"[Unit]
 Description=llama-server (TranslateGemma, GPUs={gpus}, upstream :{llama_port})
 After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -712,8 +779,8 @@ Environment="CUDA_VISIBLE_DEVICES={gpus}"
 Environment="LD_LIBRARY_PATH={ld_path}"
 ExecStart={server} --model {gguf} --host 127.0.0.1 --port {llama_port} \
   --n-gpu-layers 999 --tensor-split {tensor_split} \
-  --parallel 16 --cont-batching --flash-attn on \
-  --no-jinja --chat-template chatml --ctx-size 65536
+  --parallel {parallel} --cont-batching --flash-attn on \
+  --no-jinja --chat-template chatml --ctx-size {ctx_size}
 Restart=on-failure
 RestartSec=10
 LimitMEMLOCK=infinity
@@ -723,15 +790,13 @@ WantedBy=multi-user.target
 "#, server = LLAMA_SERVER_BIN);
     fs::write(&llama_unit, llama)?;
 
-    // shim 유닛 — upstream ready 까지 대기 + API key 지원
-    let api_key_env = std::env::var("TRANSLATE_API_KEY").unwrap_or_default();
-    let python_bin = find_python();
     let shim_unit = format!("/etc/systemd/system/{LLAMA_SHIM_UNIT_PREFIX}@{port}.service");
     let shim = format!(r#"[Unit]
 Description=TranslateGemma shim (/translate → llama-server :{llama_port})
 After=llama-server-gemma@{port}.service
 Requires=llama-server-gemma@{port}.service
-# upstream 이 늦게 떠도 shim 이 health loop 로 기다림 (ExecStartPre)
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
@@ -754,8 +819,7 @@ WantedBy=multi-user.target
     sh(&["systemctl", "daemon-reload"])?;
     sh(&["systemctl", "enable", "--now", &format!("llama-server-gemma@{port}.service")])?;
     sh(&["systemctl", "enable", "--now", &format!("{LLAMA_SHIM_UNIT_PREFIX}@{port}.service")])?;
-    println!("기동: llama-server-gemma@{port} (GPUs={gpus}, upstream :{llama_port}) + shim :{port}");
-    println!("확인: curl http://localhost:{port}/health");
+    println!("  기동: llama-server-gemma@{port} + shim :{port}");
     Ok(())
 }
 
