@@ -60,7 +60,11 @@ def translate_one(text: str, src: str, tgt: str, api: str,
                             headers={"Content-Type": "application/json"}, method="POST")
             with u.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read())
-                return data["translation"]
+                source = data.get("source", "")  # "glossary" if hit
+                tr = data["translation"]
+                if source == "glossary":
+                    sys.stderr.write(f"  📖 {text[:30]} → {tr} (glossary)\n")
+                return tr
         except Exception as e:
             last_err = e
             time.sleep(1 + attempt * 2)
@@ -208,6 +212,9 @@ def main():
 if __name__ == "__main__":
     try:
         main()
+    except FileNotFoundError as e:
+        sys.stderr.write(f"에러: 파일 없음 — {e.filename}\n")
+        sys.exit(4)
     except u.URLError as e:
         sys.stderr.write(f"에러: 번역 서버 연결 실패 — {e}\n힌트: TRANSLATE_API 환경변수 / --api 옵션 확인\n")
         sys.exit(2)
