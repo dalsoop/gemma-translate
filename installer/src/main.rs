@@ -97,6 +97,19 @@ enum GlossaryCmd {
     Add { source: String,
           translation: String,
           #[arg(long, default_value = "ko")] target: String },
+    /// 프리픽스 규칙 등록: "New" 로 시작하는 모든 번역에서 "새로운/새" → "신규" 자동 치환
+    /// glossary add-prefix "New" --source-variants "새로운,새" --replacement "신규" --target ko
+    AddPrefix {
+        /// 영어 프리픽스 (예: "New")
+        prefix: String,
+        /// 모델이 생성할 수 있는 한국어 변형들 (쉼표 구분)
+        #[arg(long)]
+        source_variants: String,
+        /// 표준 번역으로 치환할 값
+        #[arg(long)]
+        replacement: String,
+        #[arg(long, default_value = "ko")] target: String,
+    },
     /// 제거
     Remove { source: String,
              #[arg(long, default_value = "ko")] target: String },
@@ -159,6 +172,22 @@ fn glossary_cmd(g: GlossaryCmd) -> Result<()> {
             v[&source][&target] = serde_json::Value::String(translation.clone());
             glossary_save(&v)?;
             println!("추가: {source:?} → ({target}) {translation:?}");
+        }
+        GlossaryCmd::AddPrefix { prefix, source_variants, replacement, target } => {
+            ensure_root()?;
+            let mut v = glossary_load()?;
+            let variants: Vec<String> = source_variants.split(',').map(|s| s.trim().to_string()).collect();
+            let rule = serde_json::json!({
+                "source_variants": variants,
+                "replacement": replacement,
+                "target": target,
+            });
+            if !v.get("_prefix_rules").map(|r| r.is_object()).unwrap_or(false) {
+                v["_prefix_rules"] = serde_json::json!({});
+            }
+            v["_prefix_rules"][&prefix] = rule;
+            glossary_save(&v)?;
+            println!("프리픽스 규칙: \"{prefix} ...\" → 번역 후 {:?} → \"{}\"", variants, replacement);
             // shim 들 reload (글로서리는 매 요청에서 다시 읽어도 가벼움 — 별도 SIGHUP 불필요)
         }
         GlossaryCmd::Remove { source, target } => {
@@ -465,9 +494,27 @@ def _glossary_lookup(text, target):
     # normalized: strip + lowercase fallback
     tn = text.strip().lower()
     for k, v in g.items():
+        if k.startswith("_"): continue  # _prefix_rules 등 메타 키 스킵
         if k.strip().lower() == tn and isinstance(v, dict) and target in v:
             return v[target]
     return None
+
+def _apply_prefix_rules(source, translation, target):
+    """번역 결과에 프리픽스 규칙 적용. 'New Alert' → '새로운 알림' → '신규 알림'"""
+    g = _load_glossary()
+    rules = g.get("_prefix_rules")
+    if not isinstance(rules, dict): return translation
+    for prefix, rule in rules.items():
+        if not source.startswith(prefix + " "): continue
+        if rule.get("target") and rule["target"] != target: continue
+        variants = rule.get("source_variants", [])
+        replacement = rule.get("replacement", "")
+        for var in variants:
+            # "새로운 " → "신규 " or "새 " → "신규 "
+            vp = var.strip() + " "
+            if translation.startswith(vp):
+                return replacement + " " + translation[len(vp):]
+    return translation
 
 app = FastAPI()
 
@@ -561,6 +608,8 @@ async def translate(r: Req):
         out = data.get("content", "").strip()
         if out.startswith("---"): out = out[3:].lstrip()
         if out.endswith("---"): out = out[:-3].rstrip()
+        # 프리픽스 규칙 자동 적용
+        out = _apply_prefix_rules(r.text, out, r.target_lang_code)
         return {"translation": out}
     except HTTPException:
         raise
