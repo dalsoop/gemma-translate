@@ -69,8 +69,8 @@ enum Cmd {
         #[arg(long, default_value_t = 2048)]
         ctx_per_slot: u32,
     },
-    /// llama.cpp 인스턴스 중지
-    LlamaDown { port: u16 },
+    /// llama.cpp 인스턴스 중지 (--replicas N 이면 port~port+N-1 일괄)
+    LlamaDown { port: u16, #[arg(long)] replicas: Option<u32> },
 
     /// vLLM 백엔드: vllm 설치 + 모델 다운로드 (기본 Infomaniak vLLM-호환 버전)
     VllmInstall {
@@ -141,7 +141,12 @@ fn main() -> Result<()> {
         Cmd::Info { port } => info(port),
         Cmd::LlamaInstall { repo, quant, from_local } => llama_install(&repo, &quant, from_local.as_deref()),
         Cmd::LlamaUp { gpus, port, replicas, ctx_per_slot } => llama_up(&gpus, port, replicas, ctx_per_slot),
-        Cmd::LlamaDown { port } => llama_down(port),
+        Cmd::LlamaDown { port, replicas } => {
+            if let Some(n) = replicas {
+                for i in 0..n { llama_down(port + i as u16)?; }
+                Ok(())
+            } else { llama_down(port) }
+        }
         Cmd::VllmInstall { repo, quantization } => vllm_install(&repo, &quantization),
         Cmd::VllmUp { gpus, port } => vllm_up(&gpus, port),
         Cmd::VllmDown { port } => vllm_down(port),
@@ -210,16 +215,36 @@ fn glossary_cmd(g: GlossaryCmd) -> Result<()> {
                 println!("(글로서리 비어있음 — {})", GLOSSARY_PATH);
                 return Ok(());
             }
+            // 일반 항목
+            let mut count = 0usize;
             for (src, tgts) in &obj {
+                if src.starts_with('_') { continue; }
                 if let Some(tobj) = tgts.as_object() {
                     for (t, tr) in tobj {
                         if target.as_ref().map(|tt| tt == t).unwrap_or(true) {
                             println!("{src:<40} → ({t}) {tr}",
                                 tr=tr.as_str().unwrap_or(""));
+                            count += 1;
                         }
                     }
                 }
             }
+            // 프리픽스 규칙
+            if let Some(rules) = obj.get("_prefix_rules").and_then(|r| r.as_object()) {
+                if !rules.is_empty() {
+                    println!("\n── 프리픽스 규칙 ──");
+                    for (prefix, rule) in rules {
+                        let variants = rule.get("source_variants")
+                            .and_then(|v| v.as_array())
+                            .map(|a| a.iter().filter_map(|v| v.as_str()).collect::<Vec<_>>().join(", "))
+                            .unwrap_or_default();
+                        let repl = rule.get("replacement").and_then(|v| v.as_str()).unwrap_or("");
+                        let tgt = rule.get("target").and_then(|v| v.as_str()).unwrap_or("*");
+                        println!("  \"{prefix} ...\" → [{variants}] → \"{repl}\" ({tgt})");
+                    }
+                }
+            }
+            println!("\n총 {count}개 항목");
         }
         GlossaryCmd::Import { path, target, overwrite } => {
             ensure_root()?;
