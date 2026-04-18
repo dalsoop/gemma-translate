@@ -50,11 +50,21 @@ gemma-translate install                      # transformers backend
 gemma-translate llama-install [--from-local DIR]
 gemma-translate vllm-install
 
-# Instance control (per port)
-gemma-translate up|llama-up|vllm-up GPUS PORT
-gemma-translate down|llama-down|vllm-down PORT
+# Instance control (4 GPU replicas recommended)
+gemma-translate llama-up 0,1,2,3 8080 --replicas 4
+gemma-translate llama-down 8080 --replicas 4 [--keep-units]
+
+# Operations
+gemma-translate status                       # GPU/port/health 일괄 체크
+gemma-translate restart 8080 --replicas 4    # 좀비 정리 + 일괄 재기동
 gemma-translate list
 gemma-translate info PORT
+
+# Batch translation (built-in, with resume)
+gemma-translate translate \
+  -i missing.json -o translated.json \
+  -w 16 -s en -t ko \
+  --api "http://localhost:8080,...,http://localhost:8083"
 
 # Glossary (standardized terms)
 gemma-translate glossary add "Save" "저장" --target ko
@@ -99,10 +109,12 @@ Clients must send `X-API-Key: <key>` or `Authorization: Bearer <key>`.
 ```
 gemma-translate/
 ├── installer/          Rust CLI (clap + reqwest)
-│   └── src/main.rs     install/up/down/list/info + llama-* + vllm-* + glossary
+│   └── src/main.rs     install/up/down/status/restart/translate + glossary
 ├── server/
 │   ├── server.py       transformers FastAPI server (embedded in CLI)
+│   ├── shim.py         llama.cpp → /translate shim (embedded in CLI)
 │   └── requirements.txt
+├── dashboard/          Ratatui TUI (GPU 모니터 + 번역 작업 관리)
 ├── cli/
 │   └── translate       Universal translate CLI (Python)
 └── README.md
@@ -138,14 +150,13 @@ sudo gemma-translate llama-up 0,1,2,3 8080
 | 백엔드 | 처리량 | 특징 |
 |-------|-------|------|
 | transformers + NF4 | ~0.3 req/s | 단순, GPU 당 1 인스턴스 |
-| **llama.cpp + BF16 GGUF** | **~2 req/s** | 4 GPU tensor-split + continuous batching |
-| vLLM | 변동 | PagedAttention, 셋업 복잡 |
+| **llama.cpp + Q4_K_M GGUF** | **~15 req/s** | `--replicas 4` (GPU 당 독립 인스턴스) |
+| vLLM | 변동 | PagedAttention, LXC 에서는 NCCL 차단으로 불가 |
 
 자세한 명령은 `gemma-translate --help` 참고.
 
 ## Links
-- 
-- 번역 결과물: [homelab-i18n](https://github.com/dalsoop/homelab-i18n)
+- 번역 결과물: [homelab-i18n](https://github.com/dalsoop/homelab-i18n) — 8개 앱, 90K+ 키
 
 ## Dashboard (TUI)
 
