@@ -144,8 +144,8 @@ sudo gemma-translate llama-up 0,1,2,3 8080
 자세한 명령은 `gemma-translate --help` 참고.
 
 ## Links
-- Related: [translate-dashboard](https://github.com/dalsoop/translate-dashboard) (Ratatui TUI)
-- Example output: [sentry-korean-locale](https://github.com/dalsoop/sentry-korean-locale) (Sentry ko.js 15,173 entries)
+- 
+- 번역 결과물: [homelab-i18n](https://github.com/dalsoop/homelab-i18n)
 
 ## Dashboard (TUI)
 
