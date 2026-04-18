@@ -14,7 +14,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -70,7 +70,14 @@ enum Cmd {
         ctx_per_slot: u32,
     },
     /// llama.cpp 인스턴스 중지 (--replicas N 이면 port~port+N-1 일괄)
-    LlamaDown { port: u16, #[arg(long)] replicas: Option<u32> },
+    LlamaDown {
+        port: u16,
+        #[arg(long)]
+        replicas: Option<u32>,
+        /// 유닛 파일 보존 (재시작 시 llama-up 없이 restart 가능)
+        #[arg(long)]
+        keep_units: bool,
+    },
 
     /// vLLM 백엔드: vllm 설치 + 모델 다운로드 (기본 Infomaniak vLLM-호환 버전)
     VllmInstall {
@@ -85,6 +92,44 @@ enum Cmd {
     VllmUp { gpus: String, port: u16 },
     /// vLLM 인스턴스 중지
     VllmDown { port: u16 },
+
+    /// 번역 서버 전체 상태 (GPU VRAM, 포트, health 일괄 체크)
+    Status,
+
+    /// 전 인스턴스 일괄 재시작 (llama-server + shim)
+    Restart {
+        /// 시작 포트 (기본 8080)
+        #[arg(default_value_t = 8080)]
+        port: u16,
+        /// 인스턴스 수 (기본 4)
+        #[arg(long, default_value_t = 4)]
+        replicas: u32,
+    },
+
+    /// JSON 파일 번역: translate -i missing.json -o translated.json [-w 8] [-s en] [-t ko]
+    Translate {
+        /// 입력 JSON (flat: {"key": "English text", ...})
+        #[arg(short, long)]
+        input: String,
+        /// 출력 JSON
+        #[arg(short, long)]
+        output: String,
+        /// 병렬 워커 수
+        #[arg(short = 'w', long, default_value_t = 8)]
+        workers: u32,
+        /// 소스 언어 코드
+        #[arg(short = 's', long, default_value = "en")]
+        source_lang: String,
+        /// 타겟 언어 코드
+        #[arg(short = 't', long, default_value = "ko")]
+        target_lang: String,
+        /// 번역 API 엔드포인트 (쉼표 구분, 기본: TRANSLATE_API 환경변수 또는 localhost:8080~8083)
+        #[arg(long)]
+        api: Option<String>,
+        /// 번역 컨텍스트 힌트
+        #[arg(short = 'c', long)]
+        context: Option<String>,
+    },
 
     /// 글로서리(표준 번역 사전) 관리
     #[command(subcommand)]
@@ -141,15 +186,21 @@ fn main() -> Result<()> {
         Cmd::Info { port } => info(port),
         Cmd::LlamaInstall { repo, quant, from_local } => llama_install(&repo, &quant, from_local.as_deref()),
         Cmd::LlamaUp { gpus, port, replicas, ctx_per_slot } => llama_up(&gpus, port, replicas, ctx_per_slot),
-        Cmd::LlamaDown { port, replicas } => {
+        Cmd::LlamaDown { port, replicas, keep_units } => {
             if let Some(n) = replicas {
-                for i in 0..n { llama_down(port + i as u16)?; }
+                // 해당 포트 범위의 좀비 shim 프로세스 정리
+                for i in 0..n { kill_shim_on_port(port + i as u16); }
+                for i in 0..n { llama_down_impl(port + i as u16, keep_units)?; }
                 Ok(())
-            } else { llama_down(port) }
+            } else { llama_down_impl(port, keep_units) }
         }
         Cmd::VllmInstall { repo, quantization } => vllm_install(&repo, &quantization),
         Cmd::VllmUp { gpus, port } => vllm_up(&gpus, port),
         Cmd::VllmDown { port } => vllm_down(port),
+        Cmd::Status => cmd_status(),
+        Cmd::Restart { port, replicas } => cmd_restart(port, replicas),
+        Cmd::Translate { input, output, workers, source_lang, target_lang, api, context } =>
+            cmd_translate(&input, &output, workers, &source_lang, &target_lang, api.as_deref(), context.as_deref()),
         Cmd::Glossary(g) => glossary_cmd(g),
     }
 }
@@ -664,12 +715,23 @@ fn find_python() -> String {
 }
 
 fn cuda_ld_path() -> String {
-    let candidates = [
-        "/root/venv/lib/python3.11/site-packages/nvidia",
-        "/opt/translate-gemma/venv/lib/python3.11/site-packages/nvidia",
-    ];
-    let nvidia_root = candidates.iter().find(|p| Path::new(p).exists())
-        .map(|s| s.to_string()).unwrap_or_default();
+    // python 버전 자동 감지 (3.11, 3.12, 3.13 등)
+    let venv_roots = ["/root/venv/lib", "/opt/translate-gemma/venv/lib"];
+    let mut nvidia_root = String::new();
+    'outer: for venv_lib in &venv_roots {
+        if let Ok(entries) = fs::read_dir(venv_lib) {
+            for entry in entries.flatten() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with("python3") {
+                    let candidate = format!("{venv_lib}/{name}/site-packages/nvidia");
+                    if Path::new(&candidate).exists() {
+                        nvidia_root = candidate;
+                        break 'outer;
+                    }
+                }
+            }
+        }
+    }
     let mut paths = vec![format!("{LLAMA_ROOT}/build/bin")];
     for sub in ["cuda_runtime", "cublas", "cuda_nvrtc", "nccl",
                 "cufft", "curand", "cusolver", "cusparse", "cudnn"] {
@@ -806,16 +868,46 @@ fn llama_up(gpus: &str, port: u16, replicas: Option<u32>, ctx_per_slot: u32) -> 
         println!("=== replicas 모드: {n}개 독립 인스턴스 ===");
         let parallel: u32 = 4; // 독립 인스턴스는 parallel 작게
         let ctx_size = parallel * ctx_per_slot;
+
+        // 1) 해당 포트 범위의 기존 좀비 프로세스 정리
+        for i in 0..n {
+            kill_shim_on_port(port + i as u16);
+        }
+
+        // 2) 유닛 파일 일괄 생성 (기동은 아직 안 함)
         for i in 0..n {
             let gpu = gpu_list[i];
             let p = port + i as u16;
             let lp = 18000 + p as u32;
             println!("[{}/{}] GPU {} → :{p} (llama :{lp}, ctx={ctx_size}, parallel={parallel})", i+1, n, gpu);
             check_gpu_vram(gpu, 18000); // Q4_K_M ~16GB + KV cache
-            create_llama_units(gpu, "1", p, lp, &gguf, &ld_path, ctx_size, parallel)?;
+            write_llama_units(gpu, "1", p, lp, &gguf, &ld_path, ctx_size, parallel)?;
         }
+
+        // 3) daemon-reload 1회
+        sh(&["systemctl", "daemon-reload"])?;
+
+        // 4) llama-server 전부 동시 기동
+        println!("\nllama-server {n}개 동시 기동...");
+        for i in 0..n {
+            let p = port + i as u16;
+            let unit = format!("llama-server-gemma@{p}.service");
+            let _ = Command::new("systemctl").args(["reset-failed", &unit]).status();
+            let _ = Command::new("systemctl").args(["enable", "--now", &unit]).status();
+        }
+
+        // 5) shim 전부 동시 기동 (ExecStartPre에서 backend health 대기)
+        println!("shim {n}개 동시 기동 (backend 대기 중)...");
+        for i in 0..n {
+            let p = port + i as u16;
+            let unit = format!("{LLAMA_SHIM_UNIT_PREFIX}@{p}.service");
+            let _ = Command::new("systemctl").args(["reset-failed", &unit]).status();
+            let _ = Command::new("systemctl").args(["enable", "--now", &unit]).status();
+        }
+
         println!("\n{n}개 인스턴스 기동 완료.");
         println!("round-robin: TRANSLATE_API=http://localhost:{port},...,http://localhost:{}", port + n as u16 - 1);
+        println!("확인: gemma-translate status");
         return Ok(());
     }
 
@@ -833,7 +925,8 @@ fn llama_up(gpus: &str, port: u16, replicas: Option<u32>, ctx_per_slot: u32) -> 
     Ok(())
 }
 
-fn create_llama_units(
+/// 유닛 파일만 생성 (기동하지 않음). replicas 모드에서 일괄 생성 후 한번에 기동할 때 사용.
+fn write_llama_units(
     gpus: &str, tensor_split: &str, port: u16, llama_port: u32,
     gguf: &str, ld_path: &str, ctx_size: u32, parallel: u32,
 ) -> Result<()> {
@@ -842,7 +935,7 @@ fn create_llama_units(
 
     let llama_unit = format!("/etc/systemd/system/llama-server-gemma@{port}.service");
     let llama = format!(r#"[Unit]
-Description=llama-server (TranslateGemma, GPUs={gpus}, upstream :{llama_port})
+Description=llama-server (TranslateGemma, GPU={gpus}, upstream :{llama_port})
 After=network.target
 StartLimitIntervalSec=60
 StartLimitBurst=5
@@ -851,7 +944,7 @@ StartLimitBurst=5
 Type=simple
 Environment="CUDA_VISIBLE_DEVICES={gpus}"
 Environment="LD_LIBRARY_PATH={ld_path}"
-ExecStart={server} --model {gguf} --host 127.0.0.1 --port {llama_port} \
+ExecStart={server} --model "{gguf}" --host 127.0.0.1 --port {llama_port} \
   --n-gpu-layers 999 --tensor-split {tensor_split} \
   --parallel {parallel} --cont-batching --flash-attn on \
   --no-jinja --chat-template chatml --ctx-size {ctx_size}
@@ -889,7 +982,15 @@ RestartSec=5
 WantedBy=multi-user.target
 "#);
     fs::write(&shim_unit, shim)?;
+    Ok(())
+}
 
+/// 유닛 파일 생성 + 즉시 기동 (tensor-split 단일 인스턴스 모드용)
+fn create_llama_units(
+    gpus: &str, tensor_split: &str, port: u16, llama_port: u32,
+    gguf: &str, ld_path: &str, ctx_size: u32, parallel: u32,
+) -> Result<()> {
+    write_llama_units(gpus, tensor_split, port, llama_port, gguf, ld_path, ctx_size, parallel)?;
     sh(&["systemctl", "daemon-reload"])?;
     sh(&["systemctl", "enable", "--now", &format!("llama-server-gemma@{port}.service")])?;
     sh(&["systemctl", "enable", "--now", &format!("{LLAMA_SHIM_UNIT_PREFIX}@{port}.service")])?;
@@ -897,17 +998,25 @@ WantedBy=multi-user.target
     Ok(())
 }
 
-fn llama_down(port: u16) -> Result<()> {
+fn llama_down_impl(port: u16, keep_units: bool) -> Result<()> {
     ensure_root()?;
     for name in [
         format!("{LLAMA_SHIM_UNIT_PREFIX}@{port}.service"),
         format!("llama-server-gemma@{port}.service"),
     ] {
-        let _ = Command::new("systemctl").args(["disable", "--now", &name]).status();
-        let _ = fs::remove_file(format!("/etc/systemd/system/{name}"));
+        if keep_units {
+            let _ = Command::new("systemctl").args(["stop", &name]).status();
+        } else {
+            let _ = Command::new("systemctl").args(["disable", "--now", &name]).status();
+            let _ = fs::remove_file(format!("/etc/systemd/system/{name}"));
+        }
     }
     sh(&["systemctl", "daemon-reload"])?;
-    println!("중지: port {port} (llama + shim)");
+    if keep_units {
+        println!("중지: port {port} (유닛 보존 — `gemma-translate restart` 로 재기동 가능)");
+    } else {
+        println!("중지+제거: port {port}");
+    }
     Ok(())
 }
 
@@ -916,14 +1025,6 @@ fn llama_down(port: u16) -> Result<()> {
 const VLLM_MODEL_ROOT: &str = "/opt/vllm/models";
 const VLLM_META_PATH: &str = "/etc/gemma-translate/vllm.json";
 const VLLM_VENV: &str = "/opt/translate-gemma/venv"; // transformers 와 공유 (이미 설치된 경우)
-
-#[derive(Serialize, Deserialize)]
-#[allow(dead_code)]
-struct VllmMeta {
-    model_dir: String,
-    repo: String,
-    quantization: String,
-}
 
 fn vllm_install(repo: &str, quantization: &str) -> Result<()> {
     ensure_root()?;
@@ -1026,7 +1127,359 @@ fn vllm_down(port: u16) -> Result<()> {
     Ok(())
 }
 
+// ─── status / restart / translate ───
+
+fn cmd_status() -> Result<()> {
+    println!("=== 번역 서버 상태 ===\n");
+
+    // GPU 상태
+    println!("GPU:");
+    let gpu_out = Command::new("nvidia-smi")
+        .args(["--query-gpu=index,name,memory.used,memory.total,temperature.gpu", "--format=csv,noheader"])
+        .output();
+    match gpu_out {
+        Ok(o) if o.status.success() => {
+            for line in String::from_utf8_lossy(&o.stdout).lines() {
+                println!("  {line}");
+            }
+        }
+        _ => println!("  (nvidia-smi 사용 불가)"),
+    }
+
+    println!("\n포트:");
+    // systemd 유닛에서 활성 포트 자동 탐지
+    let ports = discover_llama_ports();
+    if ports.is_empty() {
+        println!("  (활성 인스턴스 없음)");
+    }
+    for port in &ports {
+        let port = *port;
+        let llama_unit = format!("llama-server-gemma@{port}.service");
+        let shim_unit = format!("translate-llama@{port}.service");
+
+        let llama_active = Command::new("systemctl")
+            .args(["is-active", &llama_unit])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|_| "unknown".into());
+
+        let shim_active = Command::new("systemctl")
+            .args(["is-active", &shim_unit])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_else(|_| "unknown".into());
+
+        // health check
+        let health = if shim_active == "active" {
+            match std::net::TcpStream::connect_timeout(
+                &format!("127.0.0.1:{port}").parse().unwrap(),
+                std::time::Duration::from_secs(2),
+            ) {
+                Ok(_) => "✓ reachable",
+                Err(_) => "✗ unreachable",
+            }
+        } else {
+            "- (shim down)"
+        };
+
+        let status_icon = match (llama_active.as_str(), shim_active.as_str()) {
+            ("active", "active") => "●",
+            ("active", _) => "◐",
+            _ => "○",
+        };
+
+        println!("  {status_icon} :{port}  backend={llama_active:<12} shim={shim_active:<12} {health}");
+    }
+
+    // glossary
+    if let Ok(v) = glossary_load() {
+        if let Some(obj) = v.as_object() {
+            let count = obj.keys().filter(|k| !k.starts_with('_')).count();
+            let prefix_count = v.get("_prefix_rules")
+                .and_then(|r| r.as_object())
+                .map(|o| o.len())
+                .unwrap_or(0);
+            println!("\n글로서리: {count}개 항목, {prefix_count}개 프리픽스 규칙");
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_restart(port: u16, replicas: u32) -> Result<()> {
+    ensure_root()?;
+    println!("=== 일괄 재시작: :{port}~:{} ({replicas}개) ===\n", port + replicas as u16 - 1);
+
+    // 1. shim 먼저 정지
+    for i in 0..replicas {
+        let p = port + i as u16;
+        let shim = format!("translate-llama@{p}.service");
+        let _ = Command::new("systemctl").args(["stop", &shim]).status();
+    }
+    println!("shim 정지 완료");
+
+    // 2. 좀비 프로세스 정리 (해당 포트 범위만)
+    for i in 0..replicas {
+        kill_shim_on_port(port + i as u16);
+    }
+
+    // 3. llama-server 재시작
+    for i in 0..replicas {
+        let p = port + i as u16;
+        let unit = format!("llama-server-gemma@{p}.service");
+        let _ = Command::new("systemctl").args(["restart", &unit]).status();
+        println!("  llama-server@{p} 재시작");
+    }
+
+    // 4. shim 재시작 (ExecStartPre가 backend health 대기)
+    for i in 0..replicas {
+        let p = port + i as u16;
+        let unit = format!("translate-llama@{p}.service");
+        let _ = Command::new("systemctl").args(["reset-failed", &unit]).status();
+        let _ = Command::new("systemctl").args(["start", &unit]).status();
+        println!("  shim@{p} 시작 (backend 대기 중...)");
+    }
+
+    println!("\n재시작 완료. `gemma-translate status` 로 상태 확인.");
+    Ok(())
+}
+
+fn cmd_translate(
+    input: &str, output: &str, workers: u32,
+    source_lang: &str, target_lang: &str,
+    api_override: Option<&str>, context: Option<&str>,
+) -> Result<()> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    use std::io::Write;
+
+    // API 엔드포인트 결정
+    let endpoints: Vec<String> = if let Some(api) = api_override {
+        api.split(',').map(|s| s.trim().to_string()).collect()
+    } else if let Ok(env_api) = std::env::var("TRANSLATE_API") {
+        env_api.split(',').map(|s| s.trim().to_string()).collect()
+    } else {
+        // 기본: systemd 유닛에서 탐지된 포트 중 살아있는 것만
+        let mut alive = Vec::new();
+        let discovered = discover_llama_ports();
+        let check_ports: Vec<u16> = if discovered.is_empty() { (8080..=8083).collect() } else { discovered };
+        for port in check_ports {
+            if std::net::TcpStream::connect_timeout(
+                &format!("127.0.0.1:{port}").parse().unwrap(),
+                std::time::Duration::from_secs(2),
+            ).is_ok() {
+                alive.push(format!("http://127.0.0.1:{port}"));
+            }
+        }
+        if alive.is_empty() {
+            bail!("활성 엔드포인트 없음. --api 로 지정하거나 TRANSLATE_API 환경변수 설정");
+        }
+        alive
+    };
+
+    println!("엔드포인트: {} ({}개)", endpoints.join(", "), endpoints.len());
+
+    // 입력 파일 로드
+    let src_text = fs::read_to_string(input).with_context(|| format!("입력 파일: {input}"))?;
+    let src: HashMap<String, serde_json::Value> = serde_json::from_str(&src_text)?;
+
+    // 이전 진행분 로드 (resume, corrupted JSON 대응)
+    let done: Arc<Mutex<HashMap<String, String>>> = if Path::new(output).exists() {
+        match serde_json::from_str::<HashMap<String, String>>(&fs::read_to_string(output)?) {
+            Ok(prev) => {
+                println!("이전 진행분: {}개 로드", prev.len());
+                Arc::new(Mutex::new(prev))
+            }
+            Err(e) => {
+                eprintln!("⚠ 기존 출력 파일 손상됨 ({e}), 처음부터 시작합니다.");
+                // 손상된 파일 백업
+                let backup = format!("{output}.corrupted");
+                let _ = fs::rename(output, &backup);
+                Arc::new(Mutex::new(HashMap::new()))
+            }
+        }
+    } else {
+        Arc::new(Mutex::new(HashMap::new()))
+    };
+
+    // 미번역 항목 추출
+    let todo: Vec<(String, String)> = {
+        let d = done.lock().unwrap();
+        src.iter()
+            .filter(|(k, _)| !d.contains_key(k.as_str()))
+            .filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string())))
+            .collect()
+    };
+
+    if todo.is_empty() {
+        println!("모든 항목 번역 완료! ({}/{})", done.lock().unwrap().len(), src.len());
+        return Ok(());
+    }
+
+    println!("번역 대상: {}개 (전체 {}개)", todo.len(), src.len());
+
+    let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fail_counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let failed_keys: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let total = todo.len();
+    let batch_save = 500;
+    let start = std::time::Instant::now();
+
+    let pool_done = Arc::clone(&done);
+    let pool_counter = Arc::clone(&counter);
+    let pool_fail_counter = Arc::clone(&fail_counter);
+    let pool_failed_keys = Arc::clone(&failed_keys);
+    let ep_list = endpoints.clone();
+
+    // 병렬 실행
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        let chunk_size = (todo.len() + workers as usize - 1) / workers as usize;
+        let todo_arc = Arc::new(todo);
+
+        for w in 0..workers {
+            let chunk_start = w as usize * chunk_size;
+            let chunk_end = std::cmp::min(chunk_start + chunk_size, total);
+            if chunk_start >= total { break; }
+
+            let ep_list = ep_list.clone();
+            let done_ref = Arc::clone(&pool_done);
+            let counter_ref = Arc::clone(&pool_counter);
+            let fail_counter_ref = Arc::clone(&pool_fail_counter);
+            let failed_keys_ref = Arc::clone(&pool_failed_keys);
+            let todo_ref = Arc::clone(&todo_arc);
+            let sl = source_lang.to_string();
+            let tl = target_lang.to_string();
+            let output_path = output.to_string();
+            let ctx = context.map(|s| s.to_string());
+
+            handles.push(scope.spawn(move || {
+                let client = reqwest::blocking::Client::builder()
+                    .timeout(std::time::Duration::from_secs(60))
+                    .build()
+                    .unwrap();
+
+                for idx in chunk_start..chunk_end {
+                    let (key, text) = &todo_ref[idx];
+                    let ep = &ep_list[idx % ep_list.len()];
+
+                    let mut body = serde_json::json!({
+                        "text": text,
+                        "source_lang_code": sl,
+                        "target_lang_code": tl,
+                        "max_new_tokens": 1024,
+                    });
+                    if let Some(ref c) = ctx {
+                        body["context"] = serde_json::Value::String(c.clone());
+                    }
+
+                    let result = client.post(format!("{ep}/translate"))
+                        .json(&body)
+                        .send()
+                        .ok()
+                        .and_then(|r| r.json::<serde_json::Value>().ok())
+                        .and_then(|j| j["translation"].as_str().map(String::from));
+
+                    // retry on failure
+                    let result = result.or_else(|| {
+                        let ep2 = &ep_list[(idx + 1) % ep_list.len()];
+                        client.post(format!("{ep2}/translate"))
+                            .json(&body)
+                            .send()
+                            .ok()
+                            .and_then(|r| r.json::<serde_json::Value>().ok())
+                            .and_then(|j| j["translation"].as_str().map(String::from))
+                    });
+
+                    if let Some(translation) = result {
+                        done_ref.lock().unwrap().insert(key.clone(), translation);
+                    } else {
+                        fail_counter_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let mut fk = failed_keys_ref.lock().unwrap();
+                        if fk.len() < 50 { fk.push(key.clone()); } // 최대 50개만 기록
+                    }
+
+                    let n = counter_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if n % 100 == 0 {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        let rate = n as f64 / elapsed;
+                        let remaining = (total - n) as f64 / rate;
+                        eprint!("\r  {n}/{total} ({rate:.1}/s, ~{:.0}m left)  ", remaining / 60.0);
+                        std::io::stderr().flush().ok();
+                    }
+                    if n % batch_save == 0 {
+                        let d = done_ref.lock().unwrap();
+                        let _ = atomic_write(&output_path, &serde_json::to_string_pretty(&*d).unwrap());
+                    }
+                }
+            }));
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+    });
+
+    // 최종 저장
+    let d = done.lock().unwrap();
+    atomic_write(output, &serde_json::to_string_pretty(&*d)?)?;
+    eprintln!();
+
+    let fails = fail_counter.load(std::sync::atomic::Ordering::Relaxed);
+    println!("완료: {}/{} 번역됨 → {output}", d.len(), src.len());
+    if fails > 0 {
+        println!("⚠ 실패: {fails}개 키 (재실행하면 자동 resume)");
+        let fk = failed_keys.lock().unwrap();
+        for k in fk.iter().take(10) {
+            println!("  - {k}");
+        }
+        if fails > 10 {
+            println!("  ... 외 {}개", fails - 10);
+        }
+    }
+    Ok(())
+}
+
 // ─── helpers ───
+
+/// systemd 유닛 파일에서 llama-server-gemma@*.service 포트 자동 탐지
+fn discover_llama_ports() -> Vec<u16> {
+    let mut ports = Vec::new();
+    let dir = "/etc/systemd/system";
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().to_string();
+            // llama-server-gemma@8080.service → 8080
+            if let Some(rest) = name.strip_prefix("llama-server-gemma@") {
+                if let Some(port_str) = rest.strip_suffix(".service") {
+                    if let Ok(port) = port_str.parse::<u16>() {
+                        ports.push(port);
+                    }
+                }
+            }
+        }
+    }
+    ports.sort();
+    ports
+}
+
+/// 특정 포트의 shim 좀비 프로세스만 정리
+fn kill_shim_on_port(port: u16) {
+    // SHIM_PORT=<port> 환경변수를 가진 프로세스만 kill
+    let cmd = format!(
+        "ps -eo pid,args | grep translate-shim.py | grep -v grep | while read pid rest; do \
+         if grep -qz 'SHIM_PORT={port}' /proc/$pid/environ 2>/dev/null; then kill $pid 2>/dev/null; fi; done"
+    );
+    let _ = Command::new("bash").args(["-c", &cmd]).status();
+}
+
+/// 원자적 파일 쓰기 (tmp → rename)
+fn atomic_write(path: &str, content: &str) -> Result<()> {
+    let tmp = format!("{path}.tmp");
+    fs::write(&tmp, content)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
+}
 
 fn ensure_root() -> Result<()> {
     #[cfg(unix)]
@@ -1051,4 +1504,3 @@ fn sh_env(envs: &[(&str, &str)], args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn _unused(_p: &Path) {}
