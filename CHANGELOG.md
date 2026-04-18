@@ -1,5 +1,23 @@
 # Changelog
 
+## [0.2.0] — 2026-04-18
+
+### Added
+- **`status`** command — GPU VRAM, 포트별 backend/shim health, glossary 현황 일괄 체크
+- **`restart`** command — 좀비 shim 프로세스 정리 + llama-server/shim 일괄 재기동
+- **`translate`** command — 내장 병렬 JSON 번역. resume 지원, 실패 키 보고, atomic write
+- **`llama-down --keep-units`** — 유닛 파일 보존 (restart로 재기동 가능)
+- `llama-up --replicas` 병렬 기동 — 유닛 일괄 생성 → daemon-reload 1회 → 동시 start
+
+### Fixed
+- batch save 비원자적 쓰기 → `.tmp` + `rename()` atomic write
+- corrupted JSON resume 시 패닉 → `.corrupted` 백업 후 처음부터 재시작
+- `status`/`translate` 포트 8080-8083 하드코딩 → systemd 유닛 자동 탐지
+- `pkill -f translate-shim.py` 전체 kill → 포트별 `SHIM_PORT` 환경변수 매칭
+- `cuda_ld_path()` python3.11 하드코딩 → `python3.*` glob 자동 탐지
+- ExecStart `--model` 경로 공백 시 깨짐 → 인용 처리
+- `VllmMeta` dead code + unused `Serialize` import 제거
+
 ## [0.1.0] — 2026-04-16
 
 First public release.
