@@ -146,3 +146,22 @@ sudo gemma-translate llama-up 0,1,2,3 8080
 ## Links
 - Related: [translate-dashboard](https://github.com/dalsoop/translate-dashboard) (Ratatui TUI)
 - Example output: [sentry-korean-locale](https://github.com/dalsoop/sentry-korean-locale) (Sentry ko.js 15,173 entries)
+
+## Dashboard (TUI)
+
+Ratatui 기반 GPU 번역 대시보드. `dashboard/` 디렉토리.
+
+```bash
+cargo run --release -p translate-dashboard -- dashboard/config.json
+```
+
+| Key | Action |
+|-----|--------|
+| `n` | New job |
+| `b` | Benchmark (10건 속도) |
+| `c` | Connector switch |
+| `?` | Help |
+| `x` | Cancel job |
+| `q` | Quit |
+
+![Main](dashboard/docs/screenshot-main.svg)

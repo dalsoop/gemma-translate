@@ -1,0 +1,3 @@
+[workspace]
+members = ["installer", "dashboard"]
+resolver = "2"
