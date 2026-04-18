@@ -85,9 +85,24 @@ or per-language:
 ## Backend-specific
 
 ### Why `llama.cpp` over `vLLM`?
-- llama.cpp + BF16 GGUF "just works" with 4-way tensor split on consumer GPUs (RTX 3090 w/o NVLink).
-- vLLM needs a separate vllm-compatible checkpoint (`Infomaniak-AI/vllm-translategemma-27b-it`) and AWQ pre-conversion for best throughput.
-- AutoAWQ is deprecated; llm-compressor is the replacement but needs setup time.
+- **vLLM TP (tensor-parallel) 은 LXC 컨테이너에서 불가** — NCCL IPC 통신이 LXC GPU passthrough 에서 차단됨. `NCCL_P2P_DISABLE=1` 로도 우회 불가.
+- vLLM TP=1 (단일 GPU) × N 인스턴스는 가능하지만 AWQ 모델 필요 (BF16 54GB 는 24GB GPU 에 안 들어감).
+- llama.cpp 는 자체 tensor-split 구현 (NCCL 불필요) → LXC 에서도 multi-GPU 정상 동작.
+
+### AWQ 변환은 왜 포기했나?
+시도한 것:
+1. **AutoAWQ** (`pip install autoawq`) — **deprecated** + transformers 5.x 와 비호환 (`PytorchGELUTanh` import 에러)
+2. **llm-compressor** (vLLM Project 후속) — `oneshot()` API 가 TranslateGemma 의 vision_tower 구조에서 실제 양자화 수행 없이 레이어 스캔만 하고 종료. `device_map`, `max_memory`, `torch_dtype` 등 인자도 HfArgumentParser 가 거부.
+3. 메모리 부족 (LXC 16GB RAM 에 52GB 모델) → 48GB 로 확장 → OOM kill
+
+**결론**: 2026-04 기준 TranslateGemma 27B (Gemma3 + vision tower) 의 AWQ 변환을 지원하는 안정적인 도구 없음. **Q4_K_M GGUF (llama-quantize)** 가 유일하게 작동하는 INT4 양자화 경로.
+
+### 최적 구성 (검증됨)
+```
+llama.cpp Q4_K_M (16GB) × 4 독립 인스턴스 (GPU 당 1개)
+= 15 req/s, 단일 latency 0.31s
+```
+이 구성이 BF16 tensor-split (2.4 req/s) 보다 6배, transformers NF4 (0.3 req/s) 보다 50배 빠름.
 
 ### Why so many backend processes?
 Only one `llama-server` process is running at a time when you use `llama-up` once with 4 GPUs (TP=4). The shim runs as a separate systemd unit so `/translate` stays up even if you restart llama-server.

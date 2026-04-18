@@ -35,3 +35,11 @@ First public release.
 ### Ships with
 - `Infomaniak-AI/vllm-translategemma-27b-it` support (vLLM-compatible variant).
 - GGUF built locally from `/root/models/translategemma-27b-it` via `convert_hf_to_gguf.py --outtype bf16`.
+
+### Tried and abandoned
+- **AWQ quantization**: AutoAWQ deprecated (incompatible with transformers 5.x).
+  llm-compressor `oneshot()` fails on TranslateGemma's vision_tower —
+  scans layers but never runs actual quantization. No working AWQ path
+  for Gemma3-based models as of 2026-04.
+- **vLLM TP>1 in LXC**: NCCL IPC blocked by LXC GPU passthrough.
+  Use bare-metal or VM for multi-GPU tensor-parallel vLLM.

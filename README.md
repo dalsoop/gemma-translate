@@ -23,9 +23,9 @@ curl -X POST http://localhost:8080/translate \
 
 - **Single Rust CLI** manages everything (install, start, stop, model switch)
 - **3 interchangeable backends**
-  - `transformers` + NF4 — simplest
-  - `llama.cpp` + BF16 GGUF — best throughput with continuous batching (**~2 req/s on 4× RTX 3090**)
-  - `vLLM` + BF16/AWQ — tensor-parallel
+  - `transformers` + NF4 — simplest (~0.3 req/s)
+  - `llama.cpp` + Q4_K_M GGUF — **recommended** (**~15 req/s on 4× RTX 3090**, `--replicas 4`)
+  - `vLLM` + BF16 — tensor-parallel (bare-metal only; LXC 에서는 NCCL 차단으로 불가)
 - **Glossary**: standardized translations bypass the model (Save→저장 always)
 - **API key auth** (optional, set `TRANSLATE_API_KEY`)
 - **Placeholder preservation**: `%s`, `%d`, `{name}`, `${var}`, `[tag]`, `<code>` kept in position
